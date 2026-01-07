@@ -6,6 +6,9 @@
 - We produce some useful visualization aids and a program to show the model performance live.
 - we collected papers and ideas and concepts here.
 
+
+FOCUS on LLM_KNOWLEDGE.pdf and NewGPT.ipynb before accessing anything else!
+
 # Dedication
 - This repository is a goldmine to completely rework your epistemic depth on large language models.
 - We explain all of our efforts as being only possible for the glory and grace of god,
