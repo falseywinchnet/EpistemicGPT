@@ -161,25 +161,6 @@ class VectorizedConstellationAttention(nn.Module):
 
         return y
 
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear( config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = x * torch.sigmoid(self.scale * x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 class Attention(nn.Module):
     def __init__(self, config):
@@ -260,7 +241,20 @@ class Attention(nn.Module):
         out = self.o_proj(y)
         return out
 
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear( config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.scale = math.pi / math.sqrt(3.0)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
 
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = x * torch.sigmoid(self.scale * x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -329,7 +323,6 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
-
 
     def forward(self, idx, targets=None):
         device = idx.device
