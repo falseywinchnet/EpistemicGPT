@@ -37,47 +37,216 @@ class RoPE(nn.Module):
         y2 = x1 * sin + x2 * cos
         return torch.stack((y1, y2), dim=-1).flatten(-2)
 
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
+
+
+class FastMLayer(nn.Module):
+    def __init__(self, input_dim,  mode='polynomial'):
+        super().__init__()
+        embed_dim = input_dim//4
+        self.n = 16 #arguably the most you will ever need for float16 precision
+        #https://arxiv.org/pdf/2008.03936
+
+        self.mode = mode
+        
+        # U: Project input to latent embedding space
+        self.embedding_u = nn.Linear(input_dim, embed_dim)
+        
+        # T + B: Map embedding to n*n matrix
+        self.generator_t = nn.Linear(embed_dim, self.n * self.n)
+        
+        # S + V: Readout
+        self.readout_s = nn.Linear(self.n * self.n, output_dim)
+        
+        # Pre-register a triangular mask to enforce the structural prior
+        # shape: (n*n) flattened
+        mask = torch.triu(torch.ones(self.n, self.n), diagonal=1).flatten()
+        self.register_buffer('triu_mask', mask)
+
+    def _compute_exact_taylor(self, M):
+        # For a strictly upper triangular matrix of size n, M^n = 0.
+        # The series is exactly I + M + M^2/2! + ... + M^(n-1)/(n-1)!
+        
+        res = torch.eye(self.n, device=M.device, dtype=M.dtype)
+        # Broadcasting identity to batch size
+        res = res.unsqueeze(0).expand(M.shape[0], -1, -1).clone()
+        
+        term = torch.eye(self.n, device=M.device, dtype=M.dtype)
+        term = term.unsqueeze(0).expand(M.shape[0], -1, -1).clone()
+        
+        # We can stop strictly at self.n, or earlier if we want lower-degree approximation
+        # The paper notes n constraints the complexity of the polynomial [cite: 416]
+        for k in range(1, self.n):
+            # M^k / k!
+            # Iterative update: term_new = term_old @ M / k
+            term = torch.bmm(term, M) / k 
+            res = res + term
+            
+        return res
+
+    def forward(self, x):
+        # 1. Project
+        x = norm(x) # Using the RMSNorm defined previously
+        latent = self.embedding_u(x)
+        
+        # 2. Generate M
+        flat_m = self.generator_t(latent)
+
+        flat_m = flat_m * self.triu_mask
+            
+        m = flat_m.view(-1, self.n, self.n)
+        
+        # 3. Exponentiate
+        # Use exact Taylor expansion (MatMul only, No Inversion)
+        exp_m = self._compute_exact_taylor(m)
+
+        # 4. Readout
+        flat_exp_m = exp_m.view(x.size(0), -1)
+        output = self.readout_s(flat_exp_m)
+        
+        return output
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.FastMLayer(config.n_embd, 4 * config.n_embd)
+        self.scale = math.pi / math.sqrt(3.0)
+        self.c_proj  = nn.FastMLayer(4 * config.n_embd, config.n_embd)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = x * torch.sigmoid(self.scale * x)
+        x = self.c_proj(x)
+        return x
+
+  
+class inlineMLP(nn.Module):
+    def __init__(self, input,hidden,out):
+        super().__init__()
+        self.c_fc    = nn.FastMLayer(input, hidden)
+        self.scale = math.pi / math.sqrt(3.0)
+        self.c_proj  = nn.FastMLayer(hidden,out)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = x * torch.sigmoid(self.scale * x)
+        x = self.c_proj(x)
+        return x
+
+def trace_nans(name, tensor):
+    if torch.isnan(tensor).any():
+        print(f"NaN detected in: {name}")
+        return True
+    return False
+
+class Attention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_embd = config.n_embd
+        self.n_branch = config.n_branch
+        self.block_size = config.block_size
+
+        # Projections: Q and V produce NB branches, K is shared
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
+        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.v_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
+        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
+        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
+
+        # RoPE should handle the embedding dimension directly now
+        self.rope = RoPE(self.n_embd, max_len=config.block_size)
+        self.attn_drop = nn.Dropout(config.dropout)
+
+    def forward(self, a, x):
+        B, T, C = x.shape
+        NB = self.n_branch
+
+        # Project and reshape: (B, T, NB, C) -> (B, NB, T, C)
+        q = self.q_proj(a).view(B, T, NB, C).transpose(1, 2)
+        v = self.v_proj(a).view(B, T, NB, C).transpose(1, 2)
+        # K has no branch dimension initially: (B, T, C) -> (B, 1, T, C)
+        k = self.k_proj(x).view(B, T, 1, C).transpose(1, 2)
+
+        # Apply RoPE
+        q, k = self.rope(q), self.rope(k)
+
+        # Raw scores: (B, NB, T, C) @ (B, 1, C, T) -> (B, NB, T, T)
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(C)
+
+        # Causal Masking
+        mask = self.mask[:, :, :T, :T]
+        att = att.masked_fill(mask == 0, float("-inf"))
+
+        # Branch Routing Logic (Softmax across the NB dimension)
+        soft_probs = F.softmax(att, dim=1)
+        soft_probs = torch.nan_to_num(soft_probs, nan=0.0)
+
+        # Straight-Through Estimator (STE)
+        with torch.no_grad():
+            max_val = soft_probs.max(dim=1, keepdim=True)[0]
+            hard_mask = (soft_probs == max_val).float()
+
+        route_mask = (hard_mask - soft_probs).detach() + soft_probs
+
+        # Temporal Attention (Softmax across the T dimension)
+        # Find global importance by taking max over branches
+        att_max, _ = att.max(dim=1)
+        attn_probs = F.softmax(att_max, dim=-1)
+        attn_probs = self.attn_drop(attn_probs)
+
+        # Composition: Combine temporal weights and branch router
+        # (B, 1, T, T) * (B, NB, T, T) -> (B, NB, T, T)
+        combined_weights = attn_probs.unsqueeze(1) * route_mask
+
+        # Weighted sum of values and sum across branches: (B, NB, T, T) @ (B, NB, T, C)
+        y = (combined_weights @ v).sum(dim=1) # (B, T, C)
+
+        out = self.o_proj(y)
+        return out
+
 class VectorizedConstellationAttention(nn.Module):
     def __init__(
         self,
-        config,
+        d_model: int,
+        n_branch: int,
         palette_hw: int = 16,
         max_k: int = 15,
         rel_hid: int = 64,
         bias: bool = False,
         use_delta: bool = True,
         delta_dropout: float = 0.1, # NEW: Probability to zero out delta
+        rope_max_len: int = 4096,
     ):
         super().__init__()
-        assert config.n_embd % 2 == 0
-        self.d = config.n_embd
-        self.BR = 1
+        assert d_model % 2 == 0
+        self.d = d_model
+        self.BR = n_branch
         self.Ph = self.Pw = palette_hw
         self.Kmax = max_k
         self.use_delta = use_delta
         self.delta_dropout = delta_dropout # Store dropout rate
 
         # Projections
-        self.i_proj = nn.Linear(config.n_embd, config.n_embd, bias=bias)
-        self.p_proj = nn.Linear(config.n_embd, config.n_embd, bias=bias)
+        self.i_proj = nn.Linear(d_model, n_branch * d_model, bias=bias)
+        self.p_proj = nn.Linear(d_model, d_model, bias=bias)
 
-        self.rope = config.rope
+        self.rope = RoPE(d_model, max_len=rope_max_len)
 
         # Persistent palette
-        self.palette = nn.Parameter(torch.randn(config.n_embd, self.Ph, self.Pw) * (config.n_embd ** -0.5))
+        self.palette = nn.Parameter(torch.randn(d_model, self.Ph, self.Pw) * (d_model ** -0.5))
 
         # Relational MLP
         rel_in = self.Kmax + 1 + (1 if use_delta else 0)
-        self.rel_mlp = nn.Sequential(
-            nn.Linear(rel_in, rel_hid),
-            nn.GELU(),
-            nn.Linear(rel_hid, rel_hid),
-            nn.GELU(),
-        )
+        self.rel_mlp =inlineMLP(rel_in, rel_hid,rel_hid)
+
         self.coord_head = nn.Linear(rel_hid, 2)
         self.mix_head   = nn.Linear(rel_hid, 1)
 
-        self.Wo = nn.Parameter(torch.randn(1, config.n_embd, config.n_embd) * (config.n_embd ** -0.5))
+        self.Wo = nn.Parameter(torch.randn(n_branch, d_model, d_model) * (d_model ** -0.5))
 
     def forward(self, x):
         B, T, D = x.shape
@@ -151,134 +320,37 @@ class VectorizedConstellationAttention(nn.Module):
         w = torch.nan_to_num(torch.softmax(mix_logits, dim=-1), nan=0.0)
 
         # 5) Sample
-        batch_pal = self.palette.unsqueeze(0).expand(B, -1, -1, -1)
-        grid = z.reshape(B, T, K, 2)
+        batch_pal = self.palette.unsqueeze(0).expand(B * self.BR, -1, -1, -1)
+        grid = z.reshape(B * self.BR, T, K, 2)
         samples = F.grid_sample(batch_pal, grid, mode="bilinear", padding_mode="border", align_corners=True)
 
-        samples = samples.view(B, 1, D, T, K).permute(0, 1, 3, 4, 2)
+        samples = samples.view(B, self.BR, D, T, K).permute(0, 1, 3, 4, 2)
         V_out = (samples * w.unsqueeze(-1)).sum(dim=3)
         y = torch.einsum("nrtd,rdm->nrtm", V_out, self.Wo).mean(dim=1)
 
         return y
 
 
-class Attention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_embd = config.n_embd
-        self.n_branch = 4
-        self.block_size = config.block_size
-        self.n_sinks = getattr(config, 'n_sinks', 4) # Default to 4 sink tokens
-
-        # Projections: Q and V produce NB branches, K is shared
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
-        self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.v_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
-        self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-
-        # Learnable sink tokens for K and V
-        # K sink is (1, 1, n_sinks, C) to broadcast across batch and branches
-        self.k_sink = nn.Parameter(torch.zeros(1, 1, self.n_sinks, config.n_embd))
-        # V sink is (1, n_branch, n_sinks, C) as V is branched
-        self.v_sink = nn.Parameter(torch.zeros(1, self.n_branch, self.n_sinks, config.n_embd))
-
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size + self.n_sinks, config.block_size + self.n_sinks))
-                             .view(1, 1, config.block_size + self.n_sinks, config.block_size + self.n_sinks))
-
-        self.rope = config.rope
-        self.attn_drop = nn.Dropout(config.dropout)
-        
-    def forward(self, a, x):
-        B, T, C = x.shape
-        NB = self.n_branch
-        NS = self.n_sinks
-
-        # Project and reshape: (B, T, NB, C) -> (B, NB, T, C)
-        q = self.q_proj(a).view(B, T, NB, C).transpose(1, 2)
-        v_orig = self.v_proj(a).view(B, T, NB, C).transpose(1, 2)
-        # K has no branch dimension initially: (B, T, C) -> (B, 1, T, C)
-        k_orig = self.k_proj(x).view(B, T, 1, C).transpose(1, 2)
-
-        # Apply RoPE to projected sequences before adding sinks
-        q, k_orig = self.rope(q), self.rope(k_orig)
-
-        # Prepend Sinks:
-        # K sinks: (1, 1, NS, C) -> (B, 1, NS, C)
-        k = torch.cat([self.k_sink.expand(B, -1, -1, -1), k_orig], dim=2)
-        # V sinks: (1, NB, NS, C) -> (B, NB, NS, C)
-        v = torch.cat([self.v_sink.expand(B, -1, -1, -1), v_orig], dim=2)
-
-        # Raw scores: (B, NB, T, C) @ (B, 1, C, T + NS) -> (B, NB, T, T + NS)
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(C)
-
-        # Causal Masking: The mask must account for the T + NS dimension
-        # Sinks are always visible, so the first NS columns are 1s
-        full_T = T + NS
-        mask = self.mask[:, :, NS:full_T, :full_T]
-        att = att.masked_fill(mask == 0, float("-inf"))
-
-        # Branch Routing Logic (Softmax across the NB dimension)
-        soft_probs = F.softmax(att, dim=1)
-        soft_probs = torch.nan_to_num(soft_probs, nan=0.0)
-
-        # Straight-Through Estimator (STE)
-        with torch.no_grad():
-            max_val = soft_probs.max(dim=1, keepdim=True)[0]
-            hard_mask = (soft_probs == max_val).float()
-
-        route_mask = (hard_mask - soft_probs).detach() + soft_probs
-
-        # Temporal Attention (Softmax across the T + NS dimension)
-        att_max, _ = att.max(dim=1)
-        attn_probs = F.softmax(att_max, dim=-1)
-
-        # Composition
-        combined_weights = attn_probs.unsqueeze(1) * route_mask
-
-        # Weighted sum: (B, NB, T, T + NS) @ (B, NB, T + NS, C) -> (B, NB, T, C)
-        y = (combined_weights @ v).sum(dim=1) 
-
-        out = self.o_proj(y)
-        return out
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear( config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = x * torch.sigmoid(self.scale * x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.think = VectorizedConstellationAttention(config)
+        self.think = VectorizedConstellationAttention(config.n_embd,config.n_branch)
         self.attn = Attention(config)
         self.mlp = MLP(config)
         self.mlp2 = MLP(config)
 
-
     def forward(self, x):
         B, T, C = x.shape
-        q = self.think(norm(x))
-        a = q + self.mlp(norm(q))
-        u = x + self.attn(norm(a), norm(x))
-        u = u + self.mlp2(norm(u)) #reconstructive shift
+        a = self.think(x)
+        a = a + self.mlp(a)
+        x = x +  self.attn(norm(a), norm(x))
+        x = x + self.mlp2(norm(x))
         steps = torch.arange(1, x.size(1) + 1, device=x.device).view(1, -1, 1)
-        running_mean = torch.cumsum(norm(a), dim=1) / steps
-        u = u + running_mean
-        return u
+        running_mean = torch.cumsum(a, dim=1) / steps
+        x= x + running_mean #add in residue percolated in time
+        return x
 
 @dataclass
 class GPTConfig:
@@ -288,10 +360,8 @@ class GPTConfig:
     n_head: int = 1
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     n_branch: int = 4 # Number of branches in Attention
-    rope: nn.Module = None
-
 
 class GPT(nn.Module):
 
@@ -301,13 +371,11 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
         # Base noise seed (learned) for map generation
-        self.rope = RoPE(config.n_embd, max_len=config.block_size)
-        self.config.rope = self.rope
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -323,6 +391,7 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
+
 
     def forward(self, idx, targets=None):
         device = idx.device
