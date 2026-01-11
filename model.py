@@ -43,7 +43,7 @@ def norm(x):
 
 
 class FastMLayer(nn.Module):
-    def __init__(self, input_dim,  mode='polynomial'):
+    def __init__(self, input_dim, output_dim):
         super().__init__()
         embed_dim = input_dim//4
         self.n = 16 #arguably the most you will ever need for float16 precision
