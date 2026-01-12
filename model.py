@@ -108,6 +108,8 @@ class InertialManifold(nn.Module):
             # Mask shape: (B, T, 1) -> Broadcasts across features
             mask = torch.bernoulli(torch.full((B, T, 1), 1.0 - self.history_dropout, device=x.device))
             x_ = x * (mask / (1.0 - self.history_dropout))
+        else:
+            x_ = x #pass through 
 
         # Transpose for Conv1d: (B, T, D) -> (B, D, T)
         x_in = x_.transpose(1, 2)
@@ -215,14 +217,31 @@ class Attention(nn.Module):
             # 3. Apply drop
             att = att.masked_fill(drop_mask, float("-inf"))
 
-        # 5. Branch Routing
-        soft_probs = F.softmax(att, dim=1)
+        # 5. Branch Routing (Lazy Softmax Patch)
+        # We replace the totalitarian F.softmax with a permissive normalization.
+        # This allows the sum of branch probabilities to be < 1.0 (Lazy), 
+        # but prevents it from exceeding 1.0.
+
+        # A. Activation (Softplus > Exp for stability and linearity)
+        branch_scores = F.softplus(att)
+
+        # B. Aggregation
+        branch_sums = branch_scores.sum(dim=1, keepdim=True)
+
+        # C. Lazy Normalization (Down to 1.0, never up)
+        branch_scale = torch.clamp(1.0 / (branch_sums + 1e-6), max=1.0)
+        soft_probs = branch_scores * branch_scale
+        
         soft_probs = torch.nan_to_num(soft_probs, nan=0.0)
 
+        # D. Hard Routing (Straight-Through Estimator)
         with torch.no_grad():
             max_val = soft_probs.max(dim=1, keepdim=True)[0]
+            # If multiple branches are equal max, this picks all of them (multi-hot),
+            # which is fine/good for equivalent hypotheses.
             hard_mask = (soft_probs == max_val).float()
 
+        # The gradients flow through soft_probs, which now reflects the "Lazy" confidence.
         route_mask = (hard_mask - soft_probs).detach() + soft_probs
 
         # 6. Temporal Normalization
@@ -288,14 +307,105 @@ class GPTConfig:
     rope: nn.Module = None
     mask: nn.Module = None
 
-class GPT(nn.Module):
+    
+class CountMinSketch(nn.Module):
+    def __init__(self, width=4096, depth=4):
+        # Increased default width to 4096. 
+        # 130 buckets for 65^2 (4225) possible bigrams is too crowded!
+        super().__init__()
+        self.width = width
+        self.depth = depth
+        self.register_buffer("table", torch.zeros(depth, width))
+        self.register_buffer("salts", torch.randint(0, 1000000, (depth, 1)))
 
+    def _hash(self, u, v):
+        combined = u * 31337 + v * 0x9e3779b9
+        return (combined.unsqueeze(0) + self.salts) % self.width
+
+    def update(self, u, v):
+        # We perform the count aggregation LOCALLY using bincount.
+        # This removes the atomic bottleneck completely.
+        with torch.no_grad():
+            hashes = self._hash(u, v) # (Depth, B*T)
+            
+            # Loop over depth (small number, e.g., 4)
+            # This is infinitely faster than serializing 250k atomic adds
+            for i in range(self.depth):
+                counts = torch.bincount(hashes[i], minlength=self.width)
+                self.table[i] += counts.float()
+
+    def query(self, u, v):
+        hashes = self._hash(u, v)
+        vals = self.table.gather(1, hashes)
+        return vals.min(dim=0)[0]
+
+
+class EpistemicLoss(nn.Module):
+    def __init__(self, config, idk_token_id=0):
+        super().__init__()
+        self.idk_id = idk_token_id
+        # Memory width/depth can be tuned based on vocab size
+        self.basis_memory = CountMinSketch(width=config.vocab_size * 2, depth=3) 
+        self.margin = 0.1 
+        self.alpha = 1.0  # NLL scale
+        self.beta = 0.5   # Basis Rank scale
+
+    def lazy_softmax(self, logits):
+        p = F.softplus(logits)
+        S = p.sum(dim=-1, keepdim=True)
+        scale = torch.clamp(1.0 / (S + 1e-6), max=1.0)
+        p_norm = p * scale
+        remainder = torch.clamp(1.0 - p_norm.sum(dim=-1, keepdim=True), min=0.0)
+        return p_norm, remainder
+
+    def forward(self, logits, targets, inputs, training=True):
+        B, T, V = logits.shape
+        flat_inputs = inputs.view(-1)
+        flat_targets = targets.view(-1)
+
+        # 1. Update Basis (Only during training)
+        if training:
+            self.basis_memory.update(flat_inputs, flat_targets)
+
+        # 2. Lazy Probability Generation
+        p_content, p_idk = self.lazy_softmax(logits)
+        
+        # Inject remainder into IDK slot for NLL calculation
+        full_probs = p_content.clone()
+        full_probs[..., self.idk_id] += p_idk.squeeze(-1)
+
+        # 3. Objective A: Standard NLL
+        log_probs = torch.log(torch.clamp(full_probs, min=1e-10))
+        nll_loss = F.nll_loss(log_probs.view(-1, V), flat_targets, ignore_index=-1)
+
+        # 4. Objective B: Epistemic Constraint
+        # Query basis strength
+        basis_counts = self.basis_memory.query(flat_inputs, flat_targets)
+        basis_strength = torch.tanh(basis_counts / 10.0) 
+
+        # Gather probs
+        p_target = full_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)
+        p_i_dont_know = full_probs[..., self.idk_id]
+
+        # Margin Loss: penalize if IDK > Target, scaled by how well we know this transition
+        diff = p_i_dont_know - p_target + self.margin
+        ranking_error = torch.clamp(diff, min=0.0)
+        
+        # We view basis_strength as (B, T) to match ranking_error
+        basis_loss = (ranking_error * basis_strength.view(B, T)).mean()
+
+        total_loss = self.alpha * nll_loss + self.beta * basis_loss
+        return total_loss
+
+class GPT(nn.Module):
+    #generative Reasoning-Aligned Pretrained Iterated Sequence Transformer(RAPIST) is a thinking class of LLM like none you've ever seen..
+    #softmax? we dont need that where we're going. Next on the chopping block? Rope. but this will need a lot more work to get it right.
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
         self.config = config
-        # Base noise seed (learned) for map generation
+        
         self.rope = RoPE(config.n_embd, max_len=config.block_size)
         self.config.rope = self.rope
         
@@ -303,7 +413,6 @@ class GPT(nn.Module):
         self.register_buffer("mask", mask_tensor)
         self.config.mask = self.mask
         
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
@@ -311,41 +420,37 @@ class GPT(nn.Module):
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # report number of parameters
+        
+        # Initialize Epistemic Loss
+        # Assuming padding/IDK token is 0. Change if necessary.
+        self.criterion = EpistemicLoss(config, idk_token_id=config.vocab_size -1)
+
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
-
 
     def forward(self, idx, targets=None):
         device = idx.device
         b, T = idx.size()
-        x = self.transformer.wte(idx) # token
+        x = self.transformer.wte(idx) 
 
-        # forward the GPT model itself
         for block in self.transformer.h:
-            x  = block(x)
-        B, T, C = x.shape
-
+            x = block(x)
+            
         x = norm(x)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-
+            # Pass idx (inputs) alongside targets for the Bigram Basis Update
+            loss = self.criterion(logits, targets, inputs=idx, training=self.training)
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # Inference:
+            # Note: The output here is raw logits. 
+            # To interpret them consistently with training, one should apply 
+            # the lazy_softmax logic externally if probabilities are needed.
+            logits = self.lm_head(x[:, [-1], :]) 
             loss = None
 
         return logits, loss
