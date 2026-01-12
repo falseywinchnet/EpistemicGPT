@@ -307,99 +307,7 @@ class GPTConfig:
     rope: nn.Module = None
     mask: nn.Module = None
 
-    
-class CountMinSketch(nn.Module):
-    def __init__(self, width=4096, depth=4):
-        # Increased default width to 4096. 
-        # 130 buckets for 65^2 (4225) possible bigrams is too crowded!
-        super().__init__()
-        self.width = width
-        self.depth = depth
-        self.register_buffer("table", torch.zeros(depth, width))
-        self.register_buffer("salts", torch.randint(0, 1000000, (depth, 1)))
-
-    def _hash(self, u, v):
-        combined = u * 31337 + v * 0x9e3779b9
-        return (combined.unsqueeze(0) + self.salts) % self.width
-
-    def update(self, u, v):
-        # We perform the count aggregation LOCALLY using bincount.
-        # This removes the atomic bottleneck completely.
-        with torch.no_grad():
-            hashes = self._hash(u, v) # (Depth, B*T)
-            
-            # Loop over depth (small number, e.g., 4)
-            # This is infinitely faster than serializing 250k atomic adds
-            for i in range(self.depth):
-                counts = torch.bincount(hashes[i], minlength=self.width)
-                self.table[i] += counts.float()
-
-    def query(self, u, v):
-        hashes = self._hash(u, v)
-        vals = self.table.gather(1, hashes)
-        return vals.min(dim=0)[0]
-
-
-class EpistemicLoss(nn.Module):
-    def __init__(self, config, idk_token_id=0):
-        super().__init__()
-        self.idk_id = idk_token_id
-        # Memory width/depth can be tuned based on vocab size
-        self.basis_memory = CountMinSketch(width=config.vocab_size * 2, depth=3) 
-        self.margin = 0.1 
-        self.alpha = 1.0  # NLL scale
-        self.beta = 0.5   # Basis Rank scale
-
-    def lazy_softmax(self, logits):
-        p = F.softplus(logits)
-        S = p.sum(dim=-1, keepdim=True)
-        scale = torch.clamp(1.0 / (S + 1e-6), max=1.0)
-        p_norm = p * scale
-        remainder = torch.clamp(1.0 - p_norm.sum(dim=-1, keepdim=True), min=0.0)
-        return p_norm, remainder
-
-    def forward(self, logits, targets, inputs, training=True):
-        B, T, V = logits.shape
-        flat_inputs = inputs.view(-1)
-        flat_targets = targets.view(-1)
-
-        # 1. Update Basis (Only during training)
-        if training:
-            self.basis_memory.update(flat_inputs, flat_targets)
-
-        # 2. Lazy Probability Generation
-        p_content, p_idk = self.lazy_softmax(logits)
-        
-        # Inject remainder into IDK slot for NLL calculation
-        full_probs = p_content.clone()
-        full_probs[..., self.idk_id] += p_idk.squeeze(-1)
-
-        # 3. Objective A: Standard NLL
-        log_probs = torch.log(torch.clamp(full_probs, min=1e-10))
-        nll_loss = F.nll_loss(log_probs.view(-1, V), flat_targets, ignore_index=-1)
-
-        # 4. Objective B: Epistemic Constraint
-        # Query basis strength
-        basis_counts = self.basis_memory.query(flat_inputs, flat_targets)
-        basis_strength = torch.tanh(basis_counts / 10.0) 
-
-        # Gather probs
-        p_target = full_probs.gather(2, targets.unsqueeze(-1)).squeeze(-1)
-        p_i_dont_know = full_probs[..., self.idk_id]
-
-        # Margin Loss: penalize if IDK > Target, scaled by how well we know this transition
-        diff = p_i_dont_know - p_target + self.margin
-        ranking_error = torch.clamp(diff, min=0.0)
-        
-        # We view basis_strength as (B, T) to match ranking_error
-        basis_loss = (ranking_error * basis_strength.view(B, T)).mean()
-
-        total_loss = self.alpha * nll_loss + self.beta * basis_loss
-        return total_loss
-
 class GPT(nn.Module):
-    #generative Reasoning-Aligned Pretrained Iterated Sequence Transformer(RAPIST) is a thinking class of LLM like none you've ever seen..
-    #softmax? we dont need that where we're going. Next on the chopping block? Rope. but this will need a lot more work to get it right.
     def __init__(self, config):
         super().__init__()
         assert config.vocab_size is not None
@@ -423,7 +331,6 @@ class GPT(nn.Module):
         
         # Initialize Epistemic Loss
         # Assuming padding/IDK token is 0. Change if necessary.
-        self.criterion = EpistemicLoss(config, idk_token_id=config.vocab_size -1)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -442,17 +349,101 @@ class GPT(nn.Module):
         x = norm(x)
 
         if targets is not None:
-            logits = self.lm_head(x)
-            # Pass idx (inputs) alongside targets for the Bigram Basis Update
-            loss = self.criterion(logits, targets, inputs=idx, training=self.training)
+            x_flat = x.view(-1, x.size(-1))
+            targets_flat = targets.view(-1)
+            mask = (targets_flat != -1)
+            
+            if mask.any():
+                x_active = x_flat[mask]
+                targets_active = targets_flat[mask]
+                
+                # Project to logits
+                logits_active = self.lm_head(x_active)
+                vocab_size = logits_active.size(-1)
+                
+                # --- UNIT UNIFICATION: Everything moves to Log-Space ---
+                # We work exclusively with log_probs. This is the common information scale.
+                log_probs = F.log_softmax(logits_active, dim=-1)
+                
+                # 1. The Target Log-Likelihood
+                target_lps = log_probs[torch.arange(targets_active.size(0)), targets_active]
+                
+                # --- 2. Term A: Confidence (The Floor) ---
+                # Requirement: P(target) >= 0.6321
+                # In Log-Space: log(P) >= log(0.6321)
+                # Formulation: Softplus( log(threshold) - log(target) )
+                # This is "Excess Log-Loss" relative to the threshold.
+                # It decays asymptotically to zero as target_lp exceeds the threshold.
+                
+                threshold_val = 1.0 - math.exp(-1.0) # ~0.6321
+                log_threshold = math.log(threshold_val) # ~-0.458
+                
+                # Smooth, scale-free penalty for being below threshold
+                loss_conf = F.softplus(log_threshold - target_lps)
+
+                # --- 3. Term B: Curvature (The Peak) ---
+                # User Requirement: Penalize excess concentration in top competitors.
+                # Formulation: log( (p2 + p3) / p_target )
+                # In Log-Space: LogSumExp(lp2, lp3) - lp_target
+                #
+                # This enforces that the Target Mass > Sum of Top 2 Competitors.
+                # It is an Entropy-based sharpness constraint.
+                
+                K = min(3, vocab_size)
+                
+                # Get top K log-probs (sorted)
+                top_lps, top_inds = torch.topk(log_probs, k=K, dim=-1)
+                
+                # Identify if target is already the winner (rank 1)
+                is_rank_1 = (top_inds[:, 0] == targets_active)
+                
+                if K >= 3:
+                    # If target is #1: Competitors are #2 and #3
+                    # If target is NOT #1: Competitors are #1 and #2 (the ones beating us)
+                    
+                    # Gather Competitor 1 Log-Probs
+                    c1_lp = torch.where(is_rank_1, top_lps[:, 1], top_lps[:, 0])
+                    
+                    # Gather Competitor 2 Log-Probs
+                    # Note: If target is not #1, we check if it is #2 to find the next competitor
+                    is_rank_2 = (top_inds[:, 1] == targets_active)
+                    c2_index_if_not_r1 = torch.where(is_rank_2, 2, 1) # If I am 2, take 3. Else take 2.
+                    
+                    # Safely gather c2 based on dynamic indices is messy in pure torch without gather
+                    # simplified logic: 
+                    # If is_rank_1: use indices 1, 2
+                    # If !is_rank_1: use indices 0, 1 (regardless of whether target is 2 or 3 or 100)
+                    # This penalizes the gap between "The Best Others" and "The Target"
+                    
+                    c2_lp = torch.where(is_rank_1, top_lps[:, 2], 
+                                       torch.where(is_rank_2, top_lps[:, 2], top_lps[:, 1]))
+
+                    # Combined Mass of Competitors in Log-Space
+                    # log(p2 + p3) = logaddexp(log_p2, log_p3)
+                    log_sum_competitors = torch.logaddexp(c1_lp, c2_lp)
+                    
+                    # The Ratio Loss: Softplus( log(Competitors) - log(Target) )
+                    # If Target > Competitors, term is negative -> Softplus decays to 0.
+                    # If Target < Competitors, term is positive -> Linear penalty.
+                    loss_curve = F.softplus(log_sum_competitors - target_lps)
+                    
+                else:
+                    # Fallback for tiny vocab: Just Margin(Best_Other - Target)
+                    c1_lp = torch.where(is_rank_1, top_lps[:, 1], top_lps[:, 0])
+                    loss_curve = F.softplus(c1_lp - target_lps)
+
+                # --- 4. The Unified Objective ---
+                # Both terms are now in "Bits/Nats of Misplaced Mass".
+                # They are additive and coherent.
+                loss = (loss_conf + loss_curve).mean()
+                
+                # Return logits for dashboard
+                logits = logits_active 
+            else:
+                loss = x.sum() * 0.0
+                logits = self.lm_head(x)
         else:
-            # Inference:
-            # Note: The output here is raw logits. 
-            # To interpret them consistently with training, one should apply 
-            # the lazy_softmax logic externally if probabilities are needed.
             logits = self.lm_head(x[:, [-1], :]) 
             loss = None
 
         return logits, loss
-
-
