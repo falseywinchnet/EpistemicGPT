@@ -10,6 +10,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class LELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = math.pi / math.sqrt(3.0)
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.scale * x)
+
 class RoPE(nn.Module):
     def __init__(self, dim, max_len=4096):
         super().__init__()
@@ -37,320 +45,235 @@ class RoPE(nn.Module):
         y2 = x1 * sin + x2 * cos
         return torch.stack((y1, y2), dim=-1).flatten(-2)
 
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-class FastMLayer(nn.Module):
-    def __init__(self, input_dim, output_dim):
+class InertialManifold(nn.Module):
+    def __init__(
+        self, 
+        config, 
+        palette_size: int = 16,     # H, W of the manifold
+        kernel_size: int = 15,      # Bandwidth of the inertial filter
+        expansion_factor: int = 2,  # Expansion for the output mixing
+    ):
         super().__init__()
-        embed_dim = input_dim//4
-        self.n = 16 #arguably the most you will ever need for float16 precision
-        #https://arxiv.org/pdf/2008.03936
+        self.d = config.n_embd
+        self.h_pal = palette_size
+        self.w_pal = palette_size
+        self.history_dropout = getattr(config, 'history_dropout', 0.1) # Probability to drop a time-step
+        
+        # 1. The Territory (Palette)
+        self.palette = nn.Parameter(
+            torch.randn(1, config.n_embd, palette_size, palette_size) * (config.n_embd ** -0.5)
+        )
+        
+        # 2. The Inertial Filter (Compass)
+        self.norm = nn.LayerNorm(config.n_embd)
+        self.inertial_conv = nn.Conv1d(
+            in_channels=config.n_embd,
+            out_channels=config.n_embd,
+            kernel_size=kernel_size,
+            padding=kernel_size - 1, # Causal padding
+            groups=config.n_embd,    # Depthwise
+            bias=False
+        )
+        
+        # 3. The Navigator (now with Dropout)
+        # Projects smoothed state -> (u, v) coordinates.
+        self.navigator = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd // 2,bias=config.bias),
+            LELU(),
+            nn.Dropout(config.dropout), # Added Dropout
+            nn.Linear(config.n_embd // 2, 2,bias=config.bias),
+            nn.Tanh() 
+        )
 
-        self.mode = mode
+        # 4. Integration (Output Projection) (now with Dropout)
+        self.output_proj = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd * expansion_factor,bias=config.bias),
+            LELU(),
+            nn.Dropout(config.dropout), # Added Dropout
+            nn.Linear(config.n_embd * expansion_factor, config.n_embd,bias=config.bias),
+            nn.Dropout(config.dropout)  # Added Final Dropout
+        )
         
-        # U: Project input to latent embedding space
-        self.embedding_u = nn.Linear(input_dim, embed_dim)
-        
-        # T + B: Map embedding to n*n matrix
-        self.generator_t = nn.Linear(embed_dim, self.n * self.n)
-        
-        # S + V: Readout
-        self.readout_s = nn.Linear(self.n * self.n, output_dim)
-        
-        # Pre-register a triangular mask to enforce the structural prior
-        # shape: (n*n) flattened
-        mask = torch.triu(torch.ones(self.n, self.n), diagonal=1).flatten()
-        self.register_buffer('triu_mask', mask)
-
-    def _compute_exact_taylor(self, M):
-        # For a strictly upper triangular matrix of size n, M^n = 0.
-        # The series is exactly I + M + M^2/2! + ... + M^(n-1)/(n-1)!
-        
-        res = torch.eye(self.n, device=M.device, dtype=M.dtype)
-        # Broadcasting identity to batch size
-        res = res.unsqueeze(0).expand(M.shape[0], -1, -1).clone()
-        
-        term = torch.eye(self.n, device=M.device, dtype=M.dtype)
-        term = term.unsqueeze(0).expand(M.shape[0], -1, -1).clone()
-        
-        # We can stop strictly at self.n, or earlier if we want lower-degree approximation
-        # The paper notes n constraints the complexity of the polynomial [cite: 416]
-        for k in range(1, self.n):
-            # M^k / k!
-            # Iterative update: term_new = term_old @ M / k
-            term = torch.bmm(term, M) / k 
-            res = res + term
-            
-        return res
+        nn.init.dirac_(self.inertial_conv.weight)
 
     def forward(self, x):
-        # 1. Project
-        x = norm(x) # Using the RMSNorm defined previously
-        latent = self.embedding_u(x)
+        B, T, D = x.shape
         
-        # 2. Generate M
-        flat_m = self.generator_t(latent)
+        # --- A. Inertial Smoothing ---
+        # Normalize
+        # Epistemic Dropout: Drop Time-Steps (History Perforation)
+        # We drop the input signal at random positions.
+        # The Conv1d must use the kernel's momentum to bridge the gap.
+        if self.training and self.history_dropout > 0:
+            # Mask shape: (B, T, 1) -> Broadcasts across features
+            mask = torch.bernoulli(torch.full((B, T, 1), 1.0 - self.history_dropout, device=x.device))
+            x_ = x * (mask / (1.0 - self.history_dropout))
 
-        flat_m = flat_m * self.triu_mask
-            
-        m = flat_m.view(-1, self.n, self.n)
+        # Transpose for Conv1d: (B, T, D) -> (B, D, T)
+        x_in = x_.transpose(1, 2)
         
-        # 3. Exponentiate
-        # Use exact Taylor expansion (MatMul only, No Inversion)
-        exp_m = self._compute_exact_taylor(m)
+        # Apply causal filter
+        x_smooth = self.inertial_conv(x_in)[:, :, :T]
+        x_smooth = x_smooth.transpose(1, 2)   # (B, T, D)
+        
+        # --- B. Navigation ---
+        coords = self.navigator(x_smooth)
+        grid = coords.view(B, 1, T, 2)
+        
+        # --- C. Territory Lookup ---
+        batch_palette = self.palette.expand(B, -1, -1, -1)
+        
+        retrieved = F.grid_sample(
+            batch_palette, 
+            grid, 
+            mode='bilinear', 
+            padding_mode='border', 
+            align_corners=True
+        )
+        
+        retrieved = retrieved.squeeze(2).transpose(1, 2)
+        
+        # --- D. Integration ---
+        y = self.output_proj(retrieved)
+        
+        return y
 
-        # 4. Readout
-        flat_exp_m = exp_m.view(x.size(0), -1)
-        output = self.readout_s(flat_exp_m)
-        
-        return output
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.FastMLayer(config.n_embd, 4 * config.n_embd)
+        self.c_fc    = nn.Linear( config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.FastMLayer(4 * config.n_embd, config.n_embd)
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
         x = x * torch.sigmoid(self.scale * x)
         x = self.c_proj(x)
+        x = self.dropout(x)
         return x
-
-  
-class inlineMLP(nn.Module):
-    def __init__(self, input,hidden,out):
-        super().__init__()
-        self.c_fc    = nn.FastMLayer(input, hidden)
-        self.scale = math.pi / math.sqrt(3.0)
-        self.c_proj  = nn.FastMLayer(hidden,out)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = x * torch.sigmoid(self.scale * x)
-        x = self.c_proj(x)
-        return x
-
-def trace_nans(name, tensor):
-    if torch.isnan(tensor).any():
-        print(f"NaN detected in: {name}")
-        return True
-    return False
 
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
-        self.n_branch = config.n_branch
+        self.n_branch = 4
         self.block_size = config.block_size
+        self.history_dropout = getattr(config, 'history_dropout', 0.1) # Default 10%
 
-        # Projections: Q and V produce NB branches, K is shared
+        # Projections
         self.q_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
         self.k_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.v_proj = nn.Linear(config.n_embd, config.n_embd * self.n_branch, bias=config.bias)
         self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
-        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
+        # Sinks
+        self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, config.n_embd))
+        self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_branch, 1, config.n_embd))
 
-        # RoPE should handle the embedding dimension directly now
-        self.rope = RoPE(self.n_embd, max_len=config.block_size)
+        # Register mask as non-persistent to fix the device mismatch bug
+        self.register_buffer("mask", config.mask, persistent=False)
+
+        self.rope = config.rope
         self.attn_drop = nn.Dropout(config.dropout)
-
+       
     def forward(self, a, x):
         B, T, C = x.shape
         NB = self.n_branch
+        device = x.device
 
-        # Project and reshape: (B, T, NB, C) -> (B, NB, T, C)
+        # 1. Projections
         q = self.q_proj(a).view(B, T, NB, C).transpose(1, 2)
+        q = norm(q)
         v = self.v_proj(a).view(B, T, NB, C).transpose(1, 2)
-        # K has no branch dimension initially: (B, T, C) -> (B, 1, T, C)
         k = self.k_proj(x).view(B, T, 1, C).transpose(1, 2)
 
-        # Apply RoPE
+        # 2. RoPE
         q, k = self.rope(q), self.rope(k)
 
-        # Raw scores: (B, NB, T, C) @ (B, 1, C, T) -> (B, NB, T, T)
+        # 3. Raw Scores
         att = (q @ k.transpose(-2, -1)) / math.sqrt(C)
 
-        # Causal Masking
-        mask = self.mask[:, :, :T, :T]
-        att = att.masked_fill(mask == 0, float("-inf"))
+        # 4. Masking Logic
+        # A. Standard Causal Mask
+        causal_mask = self.mask[:, :, :T, :T]
+        att = att.masked_fill(causal_mask == 0, float("-inf"))
 
-        # Branch Routing Logic (Softmax across the NB dimension)
+        # B. Stochastic History Dropout (Epistemic Perforation)
+        # We drop random connections in the history (k < t)
+        # but we MUST preserve the diagonal (k == t) so the Query isn't blinded.
+        if self.training and self.history_dropout > 0:
+            # 1. Generate random dropout mask (True = Drop)
+            # Shape: (B, 1, T, T) - Broadcasts across branches
+            drop_mask = torch.rand(B, 1, T, T, device=device) < self.history_dropout
+            
+            # 2. Enforce strict lower-triangularity (diagonal=-1)
+            # This ensures the diagonal (current position) and upper triangle are False.
+            drop_mask = drop_mask.tril(diagonal=-1)
+            
+            # 3. Apply drop
+            att = att.masked_fill(drop_mask, float("-inf"))
+
+        # 5. Branch Routing
         soft_probs = F.softmax(att, dim=1)
         soft_probs = torch.nan_to_num(soft_probs, nan=0.0)
 
-        # Straight-Through Estimator (STE)
         with torch.no_grad():
             max_val = soft_probs.max(dim=1, keepdim=True)[0]
             hard_mask = (soft_probs == max_val).float()
 
         route_mask = (hard_mask - soft_probs).detach() + soft_probs
 
-        # Temporal Attention (Softmax across the T dimension)
-        # Find global importance by taking max over branches
-        att_max, _ = att.max(dim=1)
-        attn_probs = F.softmax(att_max, dim=-1)
-        attn_probs = self.attn_drop(attn_probs)
+        # 6. Temporal Normalization
+        scores_max, _ = att.max(dim=1) 
+        s = F.softplus(scores_max)
+        S = s.sum(dim=-1, keepdim=True)
+        scale = torch.clamp(1.0 / (S + 1e-6), max=1.0)
+        
+        w = s * scale
+        w = self.attn_drop(w) # Standard dropout on weights still applies
 
-        # Composition: Combine temporal weights and branch router
-        # (B, 1, T, T) * (B, NB, T, T) -> (B, NB, T, T)
-        combined_weights = attn_probs.unsqueeze(1) * route_mask
+        residual = 1.0 - w.sum(dim=-1, keepdim=True)
 
-        # Weighted sum of values and sum across branches: (B, NB, T, T) @ (B, NB, T, C)
-        y = (combined_weights @ v).sum(dim=1) # (B, T, C)
+        # 7. Composition
+        combined_weights = w.unsqueeze(1) * route_mask
+        y_context = (combined_weights @ v)
 
+        branch_activity = route_mask.max(dim=-1, keepdim=True)[0] 
+        y_basis = branch_activity * self.v_sink_basis 
+
+        y_branches = (y_context + y_basis).sum(dim=1)
+        y_res = residual * self.v_sink_residual.squeeze(1) 
+
+        y = y_branches + y_res
         out = self.o_proj(y)
         return out
 
-class VectorizedConstellationAttention(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        n_branch: int,
-        palette_hw: int = 16,
-        max_k: int = 15,
-        rel_hid: int = 64,
-        bias: bool = False,
-        use_delta: bool = True,
-        delta_dropout: float = 0.1, # NEW: Probability to zero out delta
-        rope_max_len: int = 4096,
-    ):
-        super().__init__()
-        assert d_model % 2 == 0
-        self.d = d_model
-        self.BR = n_branch
-        self.Ph = self.Pw = palette_hw
-        self.Kmax = max_k
-        self.use_delta = use_delta
-        self.delta_dropout = delta_dropout # Store dropout rate
 
-        # Projections
-        self.i_proj = nn.Linear(d_model, n_branch * d_model, bias=bias)
-        self.p_proj = nn.Linear(d_model, d_model, bias=bias)
-
-        self.rope = RoPE(d_model, max_len=rope_max_len)
-
-        # Persistent palette
-        self.palette = nn.Parameter(torch.randn(d_model, self.Ph, self.Pw) * (d_model ** -0.5))
-
-        # Relational MLP
-        rel_in = self.Kmax + 1 + (1 if use_delta else 0)
-        self.rel_mlp =inlineMLP(rel_in, rel_hid,rel_hid)
-
-        self.coord_head = nn.Linear(rel_hid, 2)
-        self.mix_head   = nn.Linear(rel_hid, 1)
-
-        self.Wo = nn.Parameter(torch.randn(n_branch, d_model, d_model) * (d_model ** -0.5))
-
-    def forward(self, x):
-        B, T, D = x.shape
-        K = self.Kmax
-        scale = D ** -0.5
-        device = x.device
-
-        # 1) Projections + RoPE
-        I = self.i_proj(x).view(B, T, self.BR, D).transpose(1, 2).contiguous()
-        P = self.p_proj(x)
-
-        I = self.rope(I)
-        P = self.rope(P.unsqueeze(1)).squeeze(1)
-
-        # 2) Pass A: logits + topk
-        logits = torch.matmul(I, P.unsqueeze(1).transpose(-1, -2)) * scale
-
-        causal = torch.tril(torch.ones((T, T), device=device, dtype=torch.bool)).view(1, 1, T, T)
-        logits = logits.masked_fill(~causal, float("-inf"))
-
-        k_eff = min(K, T)
-        topk_val, topk_idx = torch.topk(logits, k=k_eff, dim=-1)
-
-        if k_eff < K:
-            pad = K - k_eff
-            topk_val = torch.cat([topk_val, topk_val.new_full((B, self.BR, T, pad), float("-inf"))], dim=-1)
-            topk_idx = torch.cat([topk_idx, topk_idx.new_zeros((B, self.BR, T, pad))], dim=-1)
-
-        keep = torch.isfinite(topk_val)
-        keep_f = keep.float()
-
-        # Fallback for empty rows
-        all_bad = ~keep.any(dim=-1, keepdim=True)
-        if all_bad.any():
-            t_idx = torch.arange(T, device=device).view(1, 1, T, 1).expand(B, self.BR, T, 1)
-            topk_idx = torch.where(all_bad, t_idx, topk_idx)
-            keep = torch.isfinite(topk_val)
-            keep_f = keep.float()
-
-        # 3) Gather features
-        b_idx = torch.arange(B, device=device).view(B, 1, 1, 1)
-        P_sel = P[b_idx, topk_idx]
-        P_sel_norm = F.normalize(P_sel, dim=-1) * keep_f.unsqueeze(-1)
-        I_norm = F.normalize(I, dim=-1).unsqueeze(3)
-
-        feat_a = (I_norm * P_sel_norm).sum(dim=-1).clamp(-1.0, 1.0) * keep_f
-        G = torch.matmul(P_sel_norm, P_sel_norm.transpose(-1, -2)).clamp(-1.0, 1.0)
-        G = G * keep_f.unsqueeze(-1) * keep_f.unsqueeze(-2)
-
-        feats = [G, feat_a.unsqueeze(-1)]
-
-        if self.use_delta:
-            t_range = torch.arange(T, device=device).view(1, 1, T, 1)
-            delta = (t_range - topk_idx).float().clamp_min(0.0) / max(1.0, float(T))
-            delta = delta * keep_f
-
-            # --- NEW: Delta Dropout (Training only) ---
-            if self.training and self.delta_dropout > 0:
-                # Create a mask: 1 with prob (1-p), 0 with prob p
-                mask = torch.bernoulli(torch.full_like(delta, 1.0 - self.delta_dropout))
-                delta = delta * mask
-
-            feats.append(delta.unsqueeze(-1))
-
-        rel_input = torch.cat(feats, dim=-1)
-
-        # 4) MLP
-        h = self.rel_mlp(rel_input)
-        z = torch.tanh(self.coord_head(h))
-        mix_logits = self.mix_head(h).squeeze(-1).masked_fill(~keep, float("-inf"))
-        w = torch.nan_to_num(torch.softmax(mix_logits, dim=-1), nan=0.0)
-
-        # 5) Sample
-        batch_pal = self.palette.unsqueeze(0).expand(B * self.BR, -1, -1, -1)
-        grid = z.reshape(B * self.BR, T, K, 2)
-        samples = F.grid_sample(batch_pal, grid, mode="bilinear", padding_mode="border", align_corners=True)
-
-        samples = samples.view(B, self.BR, D, T, K).permute(0, 1, 3, 4, 2)
-        V_out = (samples * w.unsqueeze(-1)).sum(dim=3)
-        y = torch.einsum("nrtd,rdm->nrtm", V_out, self.Wo).mean(dim=1)
-
-        return y
-
-
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.think = VectorizedConstellationAttention(config.n_embd,config.n_branch)
+        self.think = InertialManifold(config)
         self.attn = Attention(config)
         self.mlp = MLP(config)
         self.mlp2 = MLP(config)
 
+
     def forward(self, x):
         B, T, C = x.shape
-        a = self.think(x)
-        a = a + self.mlp(a)
-        x = x +  self.attn(norm(a), norm(x))
-        x = x + self.mlp2(norm(x))
+        q = self.think(norm(x))
+        a = q + self.mlp(norm(q))
+        u = x + self.attn(norm(a), norm(x))
+        u = u + self.mlp2(norm(u)) #reconstructive shift
         steps = torch.arange(1, x.size(1) + 1, device=x.device).view(1, -1, 1)
-        running_mean = torch.cumsum(a, dim=1) / steps
-        x= x + running_mean #add in residue percolated in time
-        return x
+        running_mean = torch.cumsum(norm(a), dim=1) / steps
+        u = u + running_mean
+        return u
 
 @dataclass
 class GPTConfig:
@@ -362,6 +285,8 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     n_branch: int = 4 # Number of branches in Attention
+    rope: nn.Module = None
+    mask: nn.Module = None
 
 class GPT(nn.Module):
 
@@ -371,11 +296,18 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
         # Base noise seed (learned) for map generation
+        self.rope = RoPE(config.n_embd, max_len=config.block_size)
+        self.config.rope = self.rope
+        
+        mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
+        self.register_buffer("mask", mask_tensor)
+        self.config.mask = self.mask
+        
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
