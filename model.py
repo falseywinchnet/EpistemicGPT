@@ -104,12 +104,8 @@ class InertialManifold(nn.Module):
         # Epistemic Dropout: Drop Time-Steps (History Perforation)
         # We drop the input signal at random positions.
         # The Conv1d must use the kernel's momentum to bridge the gap.
-        if self.training and self.history_dropout > 0:
-            # Mask shape: (B, T, 1) -> Broadcasts across features
-            mask = torch.bernoulli(torch.full((B, T, 1), 1.0 - self.history_dropout, device=x.device))
-            x_ = x * (mask / (1.0 - self.history_dropout))
-        else:
-            x_ = x #pass through 
+        
+        x_ = x #pass through 
 
         # Transpose for Conv1d: (B, T, D) -> (B, D, T)
         x_in = x_.transpose(1, 2)
@@ -205,17 +201,7 @@ class Attention(nn.Module):
         # B. Stochastic History Dropout (Epistemic Perforation)
         # We drop random connections in the history (k < t)
         # but we MUST preserve the diagonal (k == t) so the Query isn't blinded.
-        if self.training and self.history_dropout > 0:
-            # 1. Generate random dropout mask (True = Drop)
-            # Shape: (B, 1, T, T) - Broadcasts across branches
-            drop_mask = torch.rand(B, 1, T, T, device=device) < self.history_dropout
-            
-            # 2. Enforce strict lower-triangularity (diagonal=-1)
-            # This ensures the diagonal (current position) and upper triangle are False.
-            drop_mask = drop_mask.tril(diagonal=-1)
-            
-            # 3. Apply drop
-            att = att.masked_fill(drop_mask, float("-inf"))
+
 
         # 5. Branch Routing (Lazy Softmax Patch)
         # We replace the totalitarian F.softmax with a permissive normalization.
@@ -233,6 +219,8 @@ class Attention(nn.Module):
         soft_probs = branch_scores * branch_scale
         
         soft_probs = torch.nan_to_num(soft_probs, nan=0.0)
+        #softmax adjustment to bring us to 1.0 without softmax because torch bitches
+        soft_probs = soft_probs + (1.0 - soft_probs.sum(dim=1, keepdim=True)).clamp(min=0.0) / soft_probs.size(1)
 
         # D. Hard Routing (Straight-Through Estimator)
         with torch.no_grad():
@@ -342,6 +330,8 @@ class GPT(nn.Module):
             device = idx.device
             b, T = idx.size()
             x = self.transformer.wte(idx) 
+            if self.training:
+              x.masked_fill_(torch.rand(x.size(0), x.size(1), 1, device=x.device) < 0.01, 0.0)
 
             for block in self.transformer.h:
                 x = block(x)
