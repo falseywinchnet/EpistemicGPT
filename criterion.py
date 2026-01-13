@@ -5,12 +5,8 @@ import torch.nn.functional as F
 
 #
 #
-# Note : this wont 1:1 against CEloss. ie 1.5 does NOT mean 1.5 CE.
-# this is also softer on the model than CEloss. far softer. 
-# the temp of your trained model won't line up either.
-#multiply temps by 0.68 to get the equivalent temp.
-#0.68 temp = normal temp of 1.0
-#multiply measured any loss by ~1.47 to get the CE-equivalent measure.
+# Note : this wont 1:1 against CEloss. ie 2.0 does not mean CE 2.0
+
 
 
 class ManifoldLoss(nn.Module):
