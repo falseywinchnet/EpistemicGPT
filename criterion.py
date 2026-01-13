@@ -21,9 +21,9 @@ class ManifoldLoss(nn.Module):
         mask = (targets != self.ignore_index)
         if not mask.any(): return torch.tensor(0.0, device=logits.device, requires_grad=True)
         logits = logits[mask]; targets = targets[mask]
-        
+        loss_ce = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         # 1. Sigmoid Probabilities
-        probs = torch.tanh(logits*0.95)
+        probs = logits
         
         # Masking
         target_mask = torch.zeros_like(probs, dtype=torch.bool)
@@ -35,14 +35,6 @@ class ManifoldLoss(nn.Module):
         
         # Force 1: Targeted Brier (Drive Confidence)
         loss_target = (1.0 - p_target).pow(2)
-        
-        # Force 2: Background Suppression (Scale Invariant)
-        # We average the background noise so the gradient doesn't explode with Vocab size
-        vocab_size = logits.size(-1)
-        p_avg_bg = p_background.sum(dim=-1) 
-        
-        p_avg_bg_lim = (p_avg_bg - p_target)/ (vocab_size - 1)
-        loss_background = (p_avg_bg_lim).pow(2)
 
         # Force 3: The Margin (The Hinge)
         logits_bg = logits.clone()
@@ -53,4 +45,4 @@ class ManifoldLoss(nn.Module):
         loss_margin = F.softplus(max_bg_logits - target_logits)
 
         # Summation
-        return (loss_target + loss_background + loss_margin).mean()
+        return (loss_target + loss_margin +loss_ce/2.0).mean()
