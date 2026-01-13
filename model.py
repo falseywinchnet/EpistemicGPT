@@ -98,12 +98,7 @@ class InertialManifold(nn.Module):
 
     def forward(self, x):
         B, T, D = x.shape
-        
-        # --- A. Inertial Smoothing ---
-        # Normalize
-        # Epistemic Dropout: Drop Time-Steps (History Perforation)
-        # We drop the input signal at random positions.
-        # The Conv1d must use the kernel's momentum to bridge the gap.
+
         
         x_ = x #pass through 
 
@@ -198,9 +193,6 @@ class Attention(nn.Module):
         causal_mask = self.mask[:, :, :T, :T]
         att = att.masked_fill(causal_mask == 0, float("-inf"))
 
-        # B. Stochastic History Dropout (Epistemic Perforation)
-        # We drop random connections in the history (k < t)
-        # but we MUST preserve the diagonal (k == t) so the Query isn't blinded.
 
 
         # 5. Branch Routing (Lazy Softmax Patch)
@@ -330,8 +322,6 @@ class GPT(nn.Module):
             device = idx.device
             b, T = idx.size()
             x = self.transformer.wte(idx) 
-            if self.training:
-              x.masked_fill_(torch.rand(x.size(0), x.size(1), 1, device=x.device) < 0.01, 0.0)
 
             for block in self.transformer.h:
                 x = block(x)
