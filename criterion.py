@@ -23,7 +23,7 @@ class ManifoldLoss(nn.Module):
         logits = logits[mask]; targets = targets[mask]
         
         # 1. Sigmoid Probabilities
-        probs = torch.sigmoid(logits)
+        probs = torch.tanh(logits*0.95)
         
         # Masking
         target_mask = torch.zeros_like(probs, dtype=torch.bool)
