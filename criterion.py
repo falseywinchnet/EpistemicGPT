@@ -7,7 +7,7 @@ import torch.nn.functional as F
 #
 # Note : this wont 1:1 against CEloss. ie 1.5 does NOT mean 1.5 CE.
 # this is also softer on the model than CEloss. far softer. 
-#
+
 
 class ManifoldLoss(nn.Module):
     def __init__(self, ignore_index=-1):
