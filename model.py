@@ -381,61 +381,7 @@ class GPT(nn.Module):
                 # Smooth, scale-free penalty for being below threshold
                 loss_conf = F.softplus(log_threshold - target_lps)
 
-                # --- 3. Term B: Curvature (The Peak) ---
-                # User Requirement: Penalize excess concentration in top competitors.
-                # Formulation: log( (p2 + p3) / p_target )
-                # In Log-Space: LogSumExp(lp2, lp3) - lp_target
-                #
-                # This enforces that the Target Mass > Sum of Top 2 Competitors.
-                # It is an Entropy-based sharpness constraint.
-                
-                K = min(3, vocab_size)
-                
-                # Get top K log-probs (sorted)
-                top_lps, top_inds = torch.topk(log_probs, k=K, dim=-1)
-                
-                # Identify if target is already the winner (rank 1)
-                is_rank_1 = (top_inds[:, 0] == targets_active)
-                
-                if K >= 3:
-                    # If target is #1: Competitors are #2 and #3
-                    # If target is NOT #1: Competitors are #1 and #2 (the ones beating us)
-                    
-                    # Gather Competitor 1 Log-Probs
-                    c1_lp = torch.where(is_rank_1, top_lps[:, 1], top_lps[:, 0])
-                    
-                    # Gather Competitor 2 Log-Probs
-                    # Note: If target is not #1, we check if it is #2 to find the next competitor
-                    is_rank_2 = (top_inds[:, 1] == targets_active)
-                    c2_index_if_not_r1 = torch.where(is_rank_2, 2, 1) # If I am 2, take 3. Else take 2.
-                    
-                    # Safely gather c2 based on dynamic indices is messy in pure torch without gather
-                    # simplified logic: 
-                    # If is_rank_1: use indices 1, 2
-                    # If !is_rank_1: use indices 0, 1 (regardless of whether target is 2 or 3 or 100)
-                    # This penalizes the gap between "The Best Others" and "The Target"
-                    
-                    c2_lp = torch.where(is_rank_1, top_lps[:, 2], 
-                                       torch.where(is_rank_2, top_lps[:, 2], top_lps[:, 1]))
-
-                    # Combined Mass of Competitors in Log-Space
-                    # log(p2 + p3) = logaddexp(log_p2, log_p3)
-                    log_sum_competitors = torch.logaddexp(c1_lp, c2_lp)
-                    
-                    # The Ratio Loss: Softplus( log(Competitors) - log(Target) )
-                    # If Target > Competitors, term is negative -> Softplus decays to 0.
-                    # If Target < Competitors, term is positive -> Linear penalty.
-                    loss_curve = F.softplus(log_sum_competitors - target_lps)
-                    
-                else:
-                    # Fallback for tiny vocab: Just Margin(Best_Other - Target)
-                    c1_lp = torch.where(is_rank_1, top_lps[:, 1], top_lps[:, 0])
-                    loss_curve = F.softplus(c1_lp - target_lps)
-
-                # --- 4. The Unified Objective ---
-                # Both terms are now in "Bits/Nats of Misplaced Mass".
-                # They are additive and coherent.
-                loss = (loss_conf + loss_curve).mean()
+                loss = loss_conf.mean()
                 
                 # Return logits for dashboard
                 logits = logits_active 
