@@ -339,57 +339,58 @@ class GPT(nn.Module):
         return n_params
 
     def forward(self, idx, targets=None):
-        device = idx.device
-        b, T = idx.size()
-        x = self.transformer.wte(idx) 
+            device = idx.device
+            b, T = idx.size()
+            x = self.transformer.wte(idx) 
 
-        for block in self.transformer.h:
-            x = block(x)
-            
-        x = norm(x)
+            for block in self.transformer.h:
+                x = block(x)
+                
+            x = norm(x)
 
-        if targets is not None:
-            x_flat = x.view(-1, x.size(-1))
-            targets_flat = targets.view(-1)
-            mask = (targets_flat != -1)
-            
-            if mask.any():
-                x_active = x_flat[mask]
-                targets_active = targets_flat[mask]
+            if targets is not None:
+                x_flat = x.view(-1, x.size(-1))
+                targets_flat = targets.view(-1)
+                mask = (targets_flat != -1)
                 
-                # Project to logits
-                logits_active = self.lm_head(x_active)
-                vocab_size = logits_active.size(-1)
-                
-                # --- UNIT UNIFICATION: Everything moves to Log-Space ---
-                # We work exclusively with log_probs. This is the common information scale.
-                log_probs = F.log_softmax(logits_active, dim=-1)
-                
-                # 1. The Target Log-Likelihood
-                target_lps = log_probs[torch.arange(targets_active.size(0)), targets_active]
-                
-                # --- 2. Term A: Confidence (The Floor) ---
-                # Requirement: P(target) >= 0.6321
-                # In Log-Space: log(P) >= log(0.6321)
-                # Formulation: Softplus( log(threshold) - log(target) )
-                # This is "Excess Log-Loss" relative to the threshold.
-                # It decays asymptotically to zero as target_lp exceeds the threshold.
-                
-                threshold_val = 1.0 - math.exp(-1.0) # ~0.6321
-                log_threshold = math.log(threshold_val) # ~-0.458
-                
-                # Smooth, scale-free penalty for being below threshold
-                loss_conf = F.softplus(log_threshold - target_lps)
+                if mask.any():
+                    x_active = x_flat[mask]
+                    targets_active = targets_flat[mask]
+                    
+                    logits_active = self.lm_head(x_active)
+                    
+                    # --- Log-Space for Stability ---
+                    log_probs = F.log_softmax(logits_active, dim=-1)
+                    target_lps = log_probs[torch.arange(targets_active.size(0)), targets_active]
+                    
+                    # --- 1. The Floor (Confidence) ---
+                    # "You must be at least this tall to ride."
+                    # Penalizes (Softplus) only when below ~63%.
+                    threshold_val = 1.0 - math.exp(-1.0) # ~0.6321
+                    log_threshold = math.log(threshold_val)
+                    loss_conf = F.softplus(log_threshold - target_lps)
 
-                loss = loss_conf.mean()
-                
-                # Return logits for dashboard
-                logits = logits_active 
+                    # --- 2. The Remainder (Curvature) ---
+                    # "Always improve, but don't obsess."
+                    # We punish the gap between Probability and 1.0.
+                    # By squaring it, the penalty decays rapidly as p -> 1.0.
+                    
+                    target_probs = torch.exp(target_lps)
+                    remainder = 1.0 - target_probs
+                    
+                    # SQUARED REMAINDER:
+                    # at p=0.50, loss=0.25 (Heavy incentive)
+                    # at p=0.90, loss=0.01 (Tiny incentive)
+                    # at p=0.99, loss=0.0001 (Microscopic incentive)
+                    loss_curve = remainder.pow(2)
+
+                    loss = (loss_conf + loss_curve).mean()
+                    logits = logits_active 
+                else:
+                    loss = x.sum() * 0.0
+                    logits = self.lm_head(x)
             else:
-                loss = x.sum() * 0.0
-                logits = self.lm_head(x)
-        else:
-            logits = self.lm_head(x[:, [-1], :]) 
-            loss = None
+                logits = self.lm_head(x[:, [-1], :]) 
+                loss = None
 
-        return logits, loss
+            return logits, loss
