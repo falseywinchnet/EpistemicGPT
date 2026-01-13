@@ -3,11 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-#
-#
-# Note : this wont 1:1 against CEloss. ie 2.0 does not mean CE 2.0
-
-
 
 class ManifoldLoss(nn.Module):
     def __init__(self, ignore_index=-1):
@@ -36,13 +31,8 @@ class ManifoldLoss(nn.Module):
         # Force 1: Targeted Brier (Drive Confidence)
         loss_target = (1.0 - p_target).pow(2)
 
-        # Force 3: The Margin (The Hinge)
-        logits_bg = logits.clone()
-        logits_bg[target_mask] = float('-inf')
-        max_bg_logits, _ = logits_bg.max(dim=1)
-        target_logits = logits[target_mask]
         
         loss_margin = F.softplus(max_bg_logits - target_logits)
 
         # Summation
-        return (loss_target + loss_margin +loss_ce/2.0).mean()
+        return (loss_target  +loss_ce/2.0).mean()
