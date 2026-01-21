@@ -93,7 +93,7 @@ class Attention(nn.Module):
         k = self.rope(k)
     
         # Soft Attention
-        scores = (q @ k.transpose(-2, -1)) * (D ** -0.5)
+        scores = (q @ k.transpose(-2, -1))
         
         mask = self.mask[:, :, :T, :T]
 
