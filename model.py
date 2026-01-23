@@ -69,7 +69,6 @@ class Attention(nn.Module):
         self.head_dim = dim // self.n_heads
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
         self.o_proj = nn.Linear(dim, dim, bias=False)
 
@@ -78,14 +77,25 @@ class Attention(nn.Module):
         
         self.mask = config.mask
         self.rope = config.rope
+
         
+        self.skew_basis = nn.Parameter(torch.randn(dim, dim) * 0.02)
+
+    def get_orthogonal_matrix(self):
+       # Enforce skew-symmetry: 
+       #A = M - M.T
+       skew = self.skew_basis - self.skew_basis.T 
+       # Map to Lie Group SO(n): R = exp(A) # This guarantees R @ R.T = I 
+       return torch.matrix_exp(skew)
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
-        # Projections [B, T, H, D] -> [B, H, T, D]
+        R = self.get_orthogonal_matrix()
+        w_k = R @ self.q_proj.weight 
+
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
+        k = F.linear(x, w_k).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
         q = F.rms_norm(q, (D,))
 
@@ -98,7 +108,14 @@ class Attention(nn.Module):
         mask = self.mask[:, :, :T, :T]
 
         soft_scores = F.softplus(scores)
+        # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
+        # Values < 1e-6 do not participate in mass/scaling but receive gradients
+        threshold = 1e-6
+        pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
+        soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
+        
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
+
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
@@ -109,8 +126,7 @@ class Attention(nn.Module):
         current_mass = attn.sum(dim=-1, keepdim=True)
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
-        y = y_context + self.v_sink_basis + y_res
-        y = F.rms_norm(y, (D,))
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(y)
