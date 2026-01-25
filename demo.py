@@ -372,28 +372,35 @@ class VernierRoPE(torch.nn.Module):
     def __init__(self, dim, base_1=10000.0, base_2=9973.0):
         super().__init__()
         self.dim = dim
-        # Pre-compute the Fused Frequencies
-        # Grid A
-        inv_freq_1 = 1.0 / (base_1 ** (torch.arange(0, dim, 2).float() / dim))
-        # Grid B
-        inv_freq_2 = 1.0 / (base_2 ** (torch.arange(0, dim, 2).float() / dim))
+        # Keep grids distinct
+        self.inv_freq_1 = 1.0 / (base_1 ** (torch.arange(0, dim, 2).float() / dim))
+        self.inv_freq_2 = 1.0 / (base_2 ** (torch.arange(0, dim, 2).float() / dim))
 
-        # FUSE THEM: Simply sum the frequencies
-        # This creates the complex interference pattern in a single angle
-        self.register_buffer("inv_freq", inv_freq_1 + inv_freq_2)
-
-    def get_rotary(self, positions, device):
-        # Standard RoPE logic, but using the interference frequencies
-        freqs = torch.einsum("i,d->id", positions, self.inv_freq.to(device))
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return torch.cos(emb)[None, None, :, :], torch.sin(emb)[None, None, :, :]
-
-    def forward(self, x, position_ids,pos):
-        # Usage is identical to Standard RoPE
-        # No extra compute cost
-        cos, sin = self.get_rotary(position_ids, x.device)
+    def forward(self, x, position_ids):
+        # 1. Compute two distinct rotations
+        freqs1 = torch.einsum("i,d->id", position_ids, self.inv_freq_1.to(x.device))
+        freqs2 = torch.einsum("i,d->id", position_ids, self.inv_freq_2.to(x.device))
+        
+        # 2. The "Beat" acts as the Absolute Embedding
+        # The cosine of the difference acts as a position-dependent amplitude scaler
+        # This generalizes infinitely because it is analytic.
+        beat_freq = (freqs1 - freqs2)
+        amplitude_mod = torch.cos(beat_freq).repeat_interleave(2, dim=-1)
+        
+        # 3. Apply Standard RoPE (using one grid, or the mean) for the relative phase
+        # Let's use the mean frequency for the rotation
+        avg_freqs = (freqs1 + freqs2) / 2
+        emb = torch.cat((avg_freqs, avg_freqs), dim=-1)
+        cos, sin = torch.cos(emb), torch.sin(emb)
+        
+        # Rotate
         x_rot = torch.cat([-x[..., 1::2], x[..., 0::2]], dim=-1)
-        return (x * cos) + (x_rot * sin) + x * torch.cos(pos) + x_rot * torch.sin(pos)
+        x_rotated = (x * cos) + (x_rot * sin)
+        
+        # 4. INJECT ABSOLUTE INFO RELATIONALLY
+        # Add the beat-modulated signal. 
+        # This replaces: x + x * cos(learned_pos)
+        return x_rotated + (x * amplitude_mod) 
 
 
 class GapedDualCrossAttention(nn.Module):
@@ -439,12 +446,9 @@ class GapedDualCrossAttention(nn.Module):
 
         # Positions
         pos = torch.arange(T, device=x.device).float()
-        learned_pos = torch.tanh(self.wtp(pos.unsqueeze(-1)).unsqueeze(0).transpose(1, 2))
 
-
-
-        q = self.rope(q, pos,learned_pos)
-        k = self.rope(k, pos,learned_pos)
+        q = self.rope(q, pos)
+        k = self.rope(k, pos)
 
 
         # Soft Attention
@@ -552,7 +556,6 @@ plt.figure(figsize=(15, 6))
 # 1. Losses
 plt.subplot(1, 2, 1)
 def smooth(y): return np.convolve(y, np.ones(30)/30, mode='valid')
-plt.plot(smooth(l_rev), label="Mirror/Reverse",linestyle='--')
 plt.plot(smooth(l_ptr), label="Pointer/Index")
 plt.plot(smooth(l_par), label="Parity/Skip")
 plt.plot(smooth(l_half), label="Copy/Half")
