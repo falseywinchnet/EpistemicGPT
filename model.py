@@ -51,13 +51,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class VernierRoPE(nn.Module):
-    def __init__(self, dim, max_len=4096, base_1=10000.0, base_2=9973.0, analytic_init=False):
+    def __init__(self, dim, max_len=1024, base_1=10000.0, base_2=6180.0, analytic_init=False):
         """
         Args:
             dim: Embedding dimension (must be even).
             max_len: Pre-computed cache length.
             base_1: Primary frequency base.
             base_2: Vernier offset base (ideally prime close to base_1).
+            actually: 6180 yields a soft window around 1024 tokens
             analytic_init: Default state of the absolute position injection.
         """
         super().__init__()
