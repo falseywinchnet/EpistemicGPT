@@ -152,12 +152,103 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+
+'''
+class ElasticCoupling(nn.Module):
+    def __init__(self, dim, anisotropy_limit=0.2, rigid_budget=True):
+        super().__init__()
+        self.dim = dim
+        self.limit = anisotropy_limit
+        self.rigid_budget = rigid_budget
+        
+        # The "Stretch" parameters.
+        # Initialize to 0 (Perfect isotropy, K=Q)
+        self.elasticity = nn.Parameter(torch.zeros(dim))
+
+    def get_scale_matrix(self):
+        # 1. Enforce the "Envelope" (Hard limit on anisotropy)
+        # s will be in range [-limit, +limit]
+        s = torch.tanh(self.elasticity) * self.limit
+        
+        # 2. Enforce the "Budget" (Conservation of Volume)
+        # If rigid_budget is True, the geometric mean of scales must be 1.0.
+        # This prevents the "Loss Explosion" where K just grows universally.
+        if self.rigid_budget:
+            s = s - s.mean()
+            
+        # Convert log-space stretch to multipliers
+        # Range: [exp(-limit), exp(+limit)]
+        # e.g., if limit=0.2, scale is between 0.82 and 1.22
+        return torch.exp(s)
+
+    def forward(self, W_q):
+        # W_q: [Dim, Dim] or [Heads, Dim, Dim]
+        
+        # Get the diagonal scaling vector
+        scale = self.get_scale_matrix() # [Dim]
+        
+        # Apply the stretch to the weight matrix rows
+        # This makes K a "stretched" version of Q
+        # Broadcasting handles [Heads, Dim, Dim] if needed
+        W_k_elastic = W_q * scale.view(-1, 1) 
+        
+        return W_k_elastic
+
+# Integration into your Attention class
+class ElasticAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        # ... standard init ...
+        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        
+        # The Orthogonal Coupler (Rotates Q)
+        self.skew_basis = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
+        
+        # The Elastic Coupler (Stretches Q)
+        # limit=0.5 allows K to be up to ~1.6x sharper or duller than Q
+        self.elasticity = ElasticCoupling(config.n_embd, anisotropy_limit=0.5)
+
+    def get_k_weight(self):
+        # 1. Get Base Q Weight
+        W_q = self.q_proj.weight
+        
+        # 2. Apply Rotation (The Staple)
+        skew = self.skew_basis - self.skew_basis.T
+        R = torch.matrix_exp(skew)
+        W_rotated = R @ W_q
+        
+        # 3. Apply Elasticity (The Envelope)
+        # K is now R @ Q, but slightly stretched/squashed along axes
+        W_k = self.elasticity(W_rotated)
+        
+        return W_k
+
+    def forward(self, x):
+        # Q is standard
+        q = self.q_proj(x)
+        
+        # K is derived from the elastic weight
+        # We use F.linear with the computed weight
+        k = F.linear(x, self.get_k_weight())
+        
+        # ... RoPE, Attention ...
+        return k # (Just returning k to show the flow)
+
+#todo: try this "budget" to allow smooth<>sharp q<>k budgeting
+#obviously we cant uncouple them entirely or it does mad things
+
+'''
+
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_heads = config.n_head
+        self.n_embd = config.n_embd
         dim = config.n_embd
         self.head_dim = dim // self.n_heads
+        self.skew_basis = nn.Parameter(
+            torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
+        )
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.v_proj = nn.Linear(dim, dim, bias=False)
@@ -170,23 +261,37 @@ class Attention(nn.Module):
         self.rope = config.rope
 
         
-        self.skew_basis = nn.Parameter(torch.randn(dim, dim) * 0.02)
 
     def get_orthogonal_matrix(self):
-       # Enforce skew-symmetry: 
-       #A = M - M.T
-       skew = self.skew_basis - self.skew_basis.T 
-       return torch.matrix_exp(skew)   
+        # A = M - M.T (Skew symmetric)
+        # We broadcast the transpose over the last two dims
+        skew = self.skew_basis - self.skew_basis.transpose(-1, -2)
+        
+        # Matrix Exp for each head independently
+        # Result: [H, D_h, D_h]
+        return torch.matrix_exp(skew)
         
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
-        R = self.get_orthogonal_matrix()
-        w_k = R @ self.q_proj.weight 
+        # Get per-head rotations
+        Rs = self.get_orthogonal_matrix() # [H, D, D]
+        
+        # 1. Reshape q_proj weight to [H, D_h, Dim]
+        W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
+        
+        # 2. Rotate each head's slice of the weight matrix
+        # [H, D, D] @ [H, D, Dim] -> [H, D, Dim]
+        W_k_heads = Rs @ W_q
+        
+        # 3. Flatten back to [Dim, Dim] for the linear layer
+        # This effectively constructs a Block-Diagonal W_k
+        W_k = W_k_heads.view(-1, self.n_embd)
+        
 
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
-        k = F.linear(x, w_k).view(B, T, H, D).transpose(1, 2)
+        k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
         q = F.rms_norm(q, (D,))
 
