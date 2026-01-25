@@ -556,6 +556,7 @@ plt.figure(figsize=(15, 6))
 # 1. Losses
 plt.subplot(1, 2, 1)
 def smooth(y): return np.convolve(y, np.ones(30)/30, mode='valid')
+plt.plot(smooth(l_rev), label="Mirror/Reverse",linestyle='--')
 plt.plot(smooth(l_ptr), label="Pointer/Index")
 plt.plot(smooth(l_par), label="Parity/Skip")
 plt.plot(smooth(l_half), label="Copy/Half")
