@@ -20,7 +20,18 @@ class RoPE(nn.Module):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+
+        setfreqs =  torch.logspace(
+            start=0,
+            end=math.log10(dim),
+            steps=dim // 2
+        )
+    
+        # Sort descending to ensure inv_freq[0] is the highest frequency (standard RoPE)
+        setfreqs, _ = torch.sort(setfreqs, descending=True)
+        inv_freq = 1.0 / (10000 ** (setfreqs.float() / dim))
+
+        #inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         self.register_buffer('cos_cached', freqs.cos())
@@ -28,12 +39,12 @@ class RoPE(nn.Module):
 
     def get_embeddings(self, positions, device):
         positions = positions.clamp(0, self.max_len - 1).long()
-        cos = F.embedding(positions, self.cos_cached).unsqueeze(0).unsqueeze(0).unsqueeze(0) # [1, 1, 1, T, D]
-        sin = F.embedding(positions, self.sin_cached).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        cos = F.embedding(positions, self.cos_cached).unsqueeze(0).unsqueeze(0) # [1, 1, T, D]
+        sin = F.embedding(positions, self.sin_cached).unsqueeze(0).unsqueeze(0)
         return cos, sin
 
     def forward(self, x, positions=None):
-        # x: (B, Branch, H, T, D)
+        # x: (B, H, T, D)
         if positions is None:
             T = x.shape[-2]
             positions = torch.arange(T, device=x.device)
@@ -46,97 +57,6 @@ class RoPE(nn.Module):
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class VernierRoPE(nn.Module):
-    def __init__(self, dim, max_len=1024, base_1=10000.0, base_2=6180.0, analytic_init=False):
-        """
-        Args:
-            dim: Embedding dimension (must be even).
-            max_len: Pre-computed cache length.
-            base_1: Primary frequency base.
-            base_2: Vernier offset base (ideally prime close to base_1).
-            actually: 6180 yields a soft window around 1024 tokens
-            analytic_init: Default state of the absolute position injection.
-        """
-        super().__init__()
-        self.dim = dim
-        self.max_len = max_len
-        self.analytic = analytic_init
-
-        # 1. Establish Dual Frequency Grids
-        inv_freq_1 = 1.0 / (base_1 ** (torch.arange(0, dim, 2).float() / dim))
-        inv_freq_2 = 1.0 / (base_2 ** (torch.arange(0, dim, 2).float() / dim))
-        
-        t = torch.arange(max_len).float()
-        
-        # Outer Products [Max_Len, Dim/2]
-        freqs1 = torch.einsum('i,j->ij', t, inv_freq_1)
-        freqs2 = torch.einsum('i,j->ij', t, inv_freq_2)
-        
-        # 2. Rotation Component (Average Frequency)
-        # We use the mean to preserve standard relative phase behavior.
-        avg_freqs = (freqs1 + freqs2) / 2
-        self.register_buffer('cos_cached', avg_freqs.cos())
-        self.register_buffer('sin_cached', avg_freqs.sin())
-        
-        # 3. Analytic Component (Beat Frequency)
-        # cos(w1 - w2) -- The Moiré pattern.
-        beat_freqs = freqs1 - freqs2
-        self.register_buffer('amp_cached', beat_freqs.cos())
-
-    def forward(self, x, positions=None, analytic=None):
-        """
-        Args:
-            x: Input tensor (B, H, T, D) or (B, T, H, D)
-            positions: Specific positions indices. If None, infers from sequence length.
-            analytic: Override the default analytic injection behavior (True/False).
-        """
-        # Resolve toggle state
-        use_analytic = self.analytic if analytic is None else analytic
-
-        # Infer positions if not provided
-        if positions is None:
-            # Handle standard NLP shapes: (B, H, T, D) or (B, T, H, D)
-            # We assume T is the second to last dimension.
-            T = x.shape[-2] 
-            positions = torch.arange(T, device=x.device)
-            # Broadcast positions to batch size if needed, 
-            # but usually single sequence indexing is fine for broadcasting.
-
-        # Clamp and fetch cache
-        positions = positions.clamp(0, self.max_len - 1).long()
-        
-        # Retrieve cached slices [T, D/2]
-        cos = F.embedding(positions, self.cos_cached)
-        sin = F.embedding(positions, self.sin_cached)
-        
-        # Reshape for broadcast against (B, H, T, D)
-        # Standard RoPE typically broadcasts over Batch and Heads.
-        # We need [1, 1, T, D/2]
-        cos = cos.view(1, 1, -1, x.shape[-1] // 2)
-        sin = sin.view(1, 1, -1, x.shape[-1] // 2)
-
-        # Split input into even/odd
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
-        
-        # Apply Standard Rotation
-        y1 = x1 * cos - x2 * sin
-        y2 = x1 * sin + x2 * cos
-        
-        if use_analytic:
-            # Fetch and shape Amplitude
-            amp = F.embedding(positions, self.amp_cached)
-            amp = amp.view(1, 1, -1, x.shape[-1] // 2)
-            
-            # Inject Absolute Information additively
-            y1 = y1 + (x1 * amp)
-            y2 = y2 + (x2 * amp)
-
-        return torch.cat((y1, y2), dim=-1)
 
 class MLP(nn.Module):
     def __init__(self, config):
@@ -152,93 +72,6 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
-
-
-'''
-class ElasticCoupling(nn.Module):
-    def __init__(self, dim, anisotropy_limit=0.2, rigid_budget=True):
-        super().__init__()
-        self.dim = dim
-        self.limit = anisotropy_limit
-        self.rigid_budget = rigid_budget
-        
-        # The "Stretch" parameters.
-        # Initialize to 0 (Perfect isotropy, K=Q)
-        self.elasticity = nn.Parameter(torch.zeros(dim))
-
-    def get_scale_matrix(self):
-        # 1. Enforce the "Envelope" (Hard limit on anisotropy)
-        # s will be in range [-limit, +limit]
-        s = torch.tanh(self.elasticity) * self.limit
-        
-        # 2. Enforce the "Budget" (Conservation of Volume)
-        # If rigid_budget is True, the geometric mean of scales must be 1.0.
-        # This prevents the "Loss Explosion" where K just grows universally.
-        if self.rigid_budget:
-            s = s - s.mean()
-            
-        # Convert log-space stretch to multipliers
-        # Range: [exp(-limit), exp(+limit)]
-        # e.g., if limit=0.2, scale is between 0.82 and 1.22
-        return torch.exp(s)
-
-    def forward(self, W_q):
-        # W_q: [Dim, Dim] or [Heads, Dim, Dim]
-        
-        # Get the diagonal scaling vector
-        scale = self.get_scale_matrix() # [Dim]
-        
-        # Apply the stretch to the weight matrix rows
-        # This makes K a "stretched" version of Q
-        # Broadcasting handles [Heads, Dim, Dim] if needed
-        W_k_elastic = W_q * scale.view(-1, 1) 
-        
-        return W_k_elastic
-
-# Integration into your Attention class
-class ElasticAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # ... standard init ...
-        self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        
-        # The Orthogonal Coupler (Rotates Q)
-        self.skew_basis = nn.Parameter(torch.randn(config.n_embd, config.n_embd) * 0.02)
-        
-        # The Elastic Coupler (Stretches Q)
-        # limit=0.5 allows K to be up to ~1.6x sharper or duller than Q
-        self.elasticity = ElasticCoupling(config.n_embd, anisotropy_limit=0.5)
-
-    def get_k_weight(self):
-        # 1. Get Base Q Weight
-        W_q = self.q_proj.weight
-        
-        # 2. Apply Rotation (The Staple)
-        skew = self.skew_basis - self.skew_basis.T
-        R = torch.matrix_exp(skew)
-        W_rotated = R @ W_q
-        
-        # 3. Apply Elasticity (The Envelope)
-        # K is now R @ Q, but slightly stretched/squashed along axes
-        W_k = self.elasticity(W_rotated)
-        
-        return W_k
-
-    def forward(self, x):
-        # Q is standard
-        q = self.q_proj(x)
-        
-        # K is derived from the elastic weight
-        # We use F.linear with the computed weight
-        k = F.linear(x, self.get_k_weight())
-        
-        # ... RoPE, Attention ...
-        return k # (Just returning k to show the flow)
-
-#todo: try this "budget" to allow smooth<>sharp q<>k budgeting
-#obviously we cant uncouple them entirely or it does mad things
-
-'''
 
 class Attention(nn.Module):
     def __init__(self, config):
@@ -328,6 +161,7 @@ class Attention(nn.Module):
 
         return self.o_proj(y)
 
+
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
@@ -364,7 +198,7 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.rope = VernierRoPE(config.n_embd // config.n_head, max_len=config.block_size)
+        self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
         self.config.rope = self.rope
 
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
@@ -375,19 +209,22 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
-            wtu = nn.Linear(config.n_embd,config.vocab_size),
         ))
+
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
+        if non_embedding:
+            n_params -= self.transformer.wte.weight.numel()
         return n_params
 
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-        q = self.transformer.wtu.weight.sum(dim=0)/self.config.vocab_size
+        q = self.lm_head.weight.sum(dim=0)/self.config.vocab_size
         x = x + q #stabilize composition so we dont spend energy 
         #in construction and can route instead
         for block in self.transformer.h:
@@ -396,10 +233,10 @@ class GPT(nn.Module):
         x = norm(x)
 
         if targets is not None:
-            logits = self.transformer.wtu(x)
+            logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
-            logits = self.transformer.wtu(x[:, [-1], :])
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
