@@ -15,23 +15,33 @@ class LELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.scale * x)
 
+
 class RoPE(nn.Module):
     def __init__(self, dim, max_len=4096):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
 
-        setfreqs =  torch.logspace(
-            start=0,
-            end=math.log10(dim),
-            steps=dim // 2
-        )
-    
-        # Sort descending to ensure inv_freq[0] is the highest frequency (standard RoPE)
-        setfreqs, _ = torch.sort(setfreqs, descending=True)
-        inv_freq = 1.0 / (10000 ** (setfreqs.float() / dim))
+        #setfreqs =  torch.logspace(
+        #    start=0,
+        #    end=math.log10(dim),
+        #    steps=dim // 2
+        #) trains faster, but erodes long-context. could be good on some heads?
+        
+        
+        # Direct calculation without "base" or "ratios"
+        # Log-space boundaries
+        start_log = torch.log(torch.tensor(torch.pi / 2))
+        end_log = torch.log(torch.tensor(2 * torch.pi / max_len))
+        
+        # Interpolate directly in log space
+        # steps should arguably be dim // 2, matching the original snippet's shape
+        log_freqs = torch.linspace(start_log, end_log, steps=dim // 2)
+        
+        # Convert back to linear space
+        # Sort descending=True to match standard RoPE (High Freq at index 0)
+        inv_freq = torch.exp(log_freqs)        
 
-        #inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
         self.register_buffer('cos_cached', freqs.cos())
