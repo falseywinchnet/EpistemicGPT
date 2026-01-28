@@ -157,16 +157,25 @@ class Attention(nn.Module):
             # P(drop) is high when dist is small (Recent)
             # P(drop) is low when dist is large (Distant)
             # We clamp dist to 0 to avoid NaNs, though masking handles it
-            dist = dist.float().clamp(min=0)
-            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
             
             # Broadcast probabilities to batch/heads [1, 1, T, T]
             drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
+            dist = dist.float().clamp(min=0)
+            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
             
-            # Generate Bernoulli Mask
-            # If rand < prob, we DROP.
-            # We use 1 - prob to generate "keep" mask
-            keep_mask = torch.bernoulli(1.0 - drop_probs).bool()
+            # Align dimensions: [1, 1, T, T]
+            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
+            
+            #Expand BEFORE sampling to ensure atomic independence
+            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls 
+            # a unique die for every single head and batch item.
+            drop_probs_expanded = drop_probs.expand(B, H, T, T)
+            
+            # Generate Bernoulli Mask on the full tensor
+            keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
+            
+            # Apply Dropout
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
             
             # Apply Dropout
             # In Softplus space, 0.0 is equivalent to -inf in Log space
