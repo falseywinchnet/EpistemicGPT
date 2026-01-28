@@ -104,6 +104,10 @@ class Attention(nn.Module):
         self.mask = config.mask
         self.rope = config.rope
 
+        # alpha: Max dropout probability (at distance 0/immediate neighbor)
+        # sigma: The "width" of the recency bias. Larger = affects deeper into past.
+        self.sd_alpha = getattr(config, 'sd_alpha', 0.5) 
+        self.sd_sigma = getattr(config, 'sd_sigma', 8.0)
         
 
     def get_orthogonal_matrix(self):
@@ -168,8 +172,8 @@ class Attention(nn.Module):
             # P(drop) is low when dist is large (Distant)
             # We clamp dist to 0 to avoid NaNs, though masking handles it
             
+            
             # Broadcast probabilities to batch/heads [1, 1, T, T]
-            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
             dist = dist.float().clamp(min=0)
             drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
             
@@ -224,14 +228,10 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304
+    vocab_size: int = 66
     n_layer: int = 4
-    n_head: int = 1 #note: dont use heads with less than 64 param
-    #per head. you can use branching instead-
-    #evaluate multiple Q against one K, score individually,
-    #process though v independently, and either :
-    #mean, STE-softmax route branchwise, and feed though O.
-    #but, ultimately, better to just add a wider embedding.
+    n_head: int = 4
+  
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False
