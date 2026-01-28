@@ -190,10 +190,6 @@ class Attention(nn.Module):
             
             # Apply Dropout
             soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
-            
-            # Apply Dropout
-            # In Softplus space, 0.0 is equivalent to -inf in Log space
-            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
 
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
@@ -219,10 +215,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(norm(x))
-        x = x + self.mlp(norm(x))
+    def forward(self, x):  
+        y = x + self.attn(norm(x))
+        y = x + self.mlp(norm(y))
+        x = y 
         return x
 
 @dataclass
@@ -269,9 +265,7 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-        q = self.lm_head.weight.sum(dim=0)/self.config.vocab_size
-        x = x + q #stabilize composition so we dont spend energy 
-        #in construction and can route instead
+
         for block in self.transformer.h:
             x = block(x)
 
