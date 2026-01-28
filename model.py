@@ -146,6 +146,32 @@ class Attention(nn.Module):
         
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
+        if self.training:
+            # Create Distance Matrix [T, T]
+            # dist[i, j] = i - j
+            # We only care about positive distances (j <= i), which causal mask handles
+            indices = torch.arange(T, device=x.device)
+            dist = indices.view(-1, 1) - indices.view(1, -1)
+            
+            # Gaussian Decay Profile
+            # P(drop) is high when dist is small (Recent)
+            # P(drop) is low when dist is large (Distant)
+            # We clamp dist to 0 to avoid NaNs, though masking handles it
+            dist = dist.float().clamp(min=0)
+            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
+            
+            # Broadcast probabilities to batch/heads [1, 1, T, T]
+            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
+            
+            # Generate Bernoulli Mask
+            # If rand < prob, we DROP.
+            # We use 1 - prob to generate "keep" mask
+            keep_mask = torch.bernoulli(1.0 - drop_probs).bool()
+            
+            # Apply Dropout
+            # In Softplus space, 0.0 is equivalent to -inf in Log space
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
