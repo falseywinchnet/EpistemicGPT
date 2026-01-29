@@ -72,13 +72,13 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.scale = math.pi / math.sqrt(3.0)
+        self.act = LELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = x * torch.sigmoid(self.scale * x)
+        x = self.act(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -103,11 +103,14 @@ class Attention(nn.Module):
         
         self.mask = config.mask
         self.rope = config.rope
-
+        limit = config.block_size // 2
+            
         # alpha: Max dropout probability (at distance 0/immediate neighbor)
-        # sigma: The "width" of the recency bias. Larger = affects deeper into past.
-        self.sd_alpha = getattr(config, 'sd_alpha', 0.5) 
-        self.sd_sigma = getattr(config, 'sd_sigma', 8.0)
+        #sigma- set here to be half the block size.
+        #so, 30% dropout at the event horizon,
+        #tapering to 0% at halfway.
+        self.sd_alpha = getattr(config, 'sd_alpha', 0.3) 
+        self.sd_sigma = getattr(config, 'sd_sigma',  limit / 3.0)
         
 
     def get_orthogonal_matrix(self):
@@ -179,7 +182,12 @@ class Attention(nn.Module):
             
             # Align dimensions: [1, 1, T, T]
             drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
-            
+
+            #dont allow damage to the first half, regardless
+            #limited suppot positions do not get eroded
+            limit = T // 2
+            absolute_cutoff_mask = (dist > limit)
+            drop_probs = drop_probs.masked_fill(absolute_cutoff_mask, 0.0)
             #Expand BEFORE sampling to ensure atomic independence
             # We must explicitly expand to [B, H, T, T] so Bernoulli rolls 
             # a unique die for every single head and batch item.
