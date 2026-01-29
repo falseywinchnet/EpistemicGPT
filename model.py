@@ -215,10 +215,10 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
+        self.gamma = nn.Parameter(torch.ones(1))
     def forward(self, x):  
-        y = x + self.attn(norm(x))
-        y = x + self.mlp(norm(y))
-        x = y 
+        y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
+        x = norm(x*F.sigmoid(self.gamma) + self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
         return x
 
 @dataclass
@@ -234,6 +234,67 @@ class GPTConfig:
     rope: nn.Module = None
     mask: torch.Tensor = None
 
+class ConstrainedSimplexLoss(nn.Module):
+    """
+    A CrossEntropy wrapper that conditions the gradient descent to the 
+    tangent cone of the probability simplex (Sum(p)=1).
+    Cramer-Rao Bound for Arbitrarily Constrained Sets
+
+    Heedong Do, Member, IEEE, Angel Lozano, Fellow, IEEE
+    
+    Paper alignment:
+    - Enforces the 'span of the tangent cone' constraint[cite: 7, 37].
+    - Applies Projection Matrix Pi derived in Theorem 3[cite: 165].
+    - Valid for singular Fisher Information Matrices common in ML[cite: 6].
+    """
+    def __init__(self, vocab_size=66, ignore_index=-1):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.ignore_index = ignore_index
+        
+        # Construct Projection Matrix Pi = I - (1/V) * 11^T
+        # This projects gradients onto the zero-sum subspace (the tangent space of the simplex).
+        I = torch.eye(vocab_size)
+        ones = torch.ones(vocab_size, vocab_size)
+        
+        # Register as a buffer so it saves with the model but doesn't update as a parameter
+        self.register_buffer('Pi', I - (ones / vocab_size))
+
+    def _project_gradient(self, grad):
+        """
+        Backward hook: Projects gradients onto the geometric tangent plane.
+        This ensures updates strictly respect the conservation of probability mass.
+        """
+        # Handle flattened or batched gradients
+        if grad.dim() > 1:
+            return grad @ self.Pi
+        return self.Pi @ grad
+
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (Batch, Seq_Len, Vocab) or (Batch, Vocab)
+            targets: (Batch, Seq_Len) or (Batch)
+        """
+        # 1. Flatten for CrossEntropy (matches your snippet's logic)
+        # view(-1, vocab_size) ensures compatibility with (B, T, V) or (B, V)
+        flat_logits = logits.view(-1, self.vocab_size)
+        flat_targets = targets.view(-1)
+
+        # 2. Register the geometric constraint hook on the computation graph
+        # This intercepts the backward pass before it reaches the model parameters.
+        if flat_logits.requires_grad:
+            flat_logits.register_hook(self._project_gradient)
+
+        # 3. Compute standard CE loss
+        loss = F.cross_entropy(
+            flat_logits, 
+            flat_targets, 
+            ignore_index=self.ignore_index
+        )
+        
+        return loss
+        
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -251,7 +312,7 @@ class GPT(nn.Module):
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
         ))
-
+        self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -273,7 +334,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = self.criterion(logits, targets)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
