@@ -242,36 +242,82 @@ class GPTConfig:
     rope: nn.Module = None
     mask: torch.Tensor = None
 
-#copyright joshuah.rainstar@gmail.com MIT 2026
+class ConstrainedSimplexLoss(nn.Module):
+    """
+    A CrossEntropy wrapper that conditions the gradient descent to the 
+    tangent cone of the probability simplex (Sum(p)=1).
+    Cramer-Rao Bound for Arbitrarily Constrained Sets
 
-class RiemannianManifoldLoss(nn.Module):
+    Heedong Do, Member, IEEE, Angel Lozano, Fellow, IEEE
+    
+    Paper alignment:
+    - Enforces the 'span of the tangent cone' constraint[cite: 7, 37].
+    - Applies Projection Matrix Pi derived in Theorem 3[cite: 165].
+    - Valid for singular Fisher Information Matrices common in ML[cite: 6].
     """
-    A unified loss function that:
-    1. Geometrically constrains gradients to the Tangent Cone of the Simplex [Do & Lozano, Thm 3].
-    2. Kinematically constrains gradient magnitude to the Entropic Energy of the data stream.
-    """
-    def __init__(self, config, ignore_index=-1):
+    def __init__(self, vocab_size=66, ignore_index=-1):
         super().__init__()
-        self.vocab_size = config.vocab_size
+        self.vocab_size = vocab_size
         self.ignore_index = ignore_index
-        self.sketch_dim = config.block_size*2
-        # --- IDEA 1: GEOMETRIC PROJECTION (The Rails) ---
-        # "The key geometric object... is the tangent cone... whose span determines accuracy" 
+        
         # Construct Projection Matrix Pi = I - (1/V) * 11^T
+        # This projects gradients onto the zero-sum subspace (the tangent space of the simplex).
         I = torch.eye(vocab_size)
         ones = torch.ones(vocab_size, vocab_size)
-        self.register_buffer('Pi', I - (ones / vocab_size))
         
+        # Register as a buffer so it saves with the model but doesn't update as a parameter
+        self.register_buffer('Pi', I - (ones / vocab_size))
+
     def _project_gradient(self, grad):
         """
-        Projects gradients onto span(T_Theta), the tangent space of the simplex.
-        "It suffices to test a unique Pi, which is the projection matrix onto span T_Theta".
+        Backward hook: Projects gradients onto the geometric tangent plane.
+        This ensures updates strictly respect the conservation of probability mass.
         """
+        # Handle flattened or batched gradients
         if grad.dim() > 1:
             return grad @ self.Pi
         return self.Pi @ grad
 
-    def _compute_entropic_energy(self, input_ids):
+    def forward(self, logits, targets):
+        """
+        Args:
+            logits: (Batch, Seq_Len, Vocab) or (Batch, Vocab)
+            targets: (Batch, Seq_Len) or (Batch)
+        """
+        # 1. Flatten for CrossEntropy (matches your snippet's logic)
+        # view(-1, vocab_size) ensures compatibility with (B, T, V) or (B, V)
+        flat_logits = logits.view(-1, self.vocab_size)
+        flat_targets = targets.view(-1)
+
+        # 2. Register the geometric constraint hook on the computation graph
+        # This intercepts the backward pass before it reaches the model parameters.
+        if flat_logits.requires_grad:
+            flat_logits.register_hook(self._project_gradient)
+
+        # 3. Compute standard CE loss
+        loss = F.cross_entropy(
+            flat_logits, 
+            flat_targets, 
+            ignore_index=self.ignore_index
+        )
+        
+        return loss        # This handles the singularity by clamping the ratio.
+        
+        # We use sqrt to align dimensions (Distance vs Distance^2)
+        metric_loss = torch.sqrt(raw_nll + 1e-6)
+        
+        scale = energy_limit / (metric_loss + 1e-6)
+        scale = torch.clamp(scale, max=1.0)
+        
+        # Apply Scale (Detached)
+        # We scale the *original* NLL so gradients are scaled proportionally
+        final_loss = raw_nll * scale.detach()
+        
+        return final_loss.mean()
+
+
+
+def _compute_entropic_energy(self, input_ids):
         """
         Computes the Wasserstein Energy using Manifold Sketching.
         INCLUDES ACTIVE MASKING to prevent 'Ghost Bin' model collapse.
@@ -334,51 +380,6 @@ class RiemannianManifoldLoss(nn.Module):
         
         return energy_limit
     
-
-    def forward(self, logits, targets, input_ids):
-        # 1. Geometric Projection Hook
-        # We attach the hook to logits so the backward pass flows through Pi
-        if logits.requires_grad:
-            logits.register_hook(self._project_gradient)
-            
-        # 2. Compute Kinematic Energy Limit
-        # We need energy for the valid prediction window (T-1)
-        # Note: input_ids includes the full context.
-        energy_limit = self._compute_entropic_energy(input_ids)
-        
-        # 3. Align Logits/Targets
-        valid_steps = energy_limit.size(1)
-        valid_logits = logits[:, :valid_steps, :]
-        valid_targets = targets[:, :valid_steps]
-        
-        # 4. Raw Cross Entropy (The "Curved" Distance^2)
-        raw_nll = F.cross_entropy(
-            valid_logits.reshape(-1, self.vocab_size), 
-            valid_targets.reshape(-1), 
-            reduction='none',
-            ignore_index=self.ignore_index
-        ).view(energy_limit.shape)
-        
-        # 5. Dimensional Scaling
-        # Scale = Energy / sqrt(Loss)
-        # "Valid for singular Fisher Information Matrices" [cite: 6]
-        # This handles the singularity by clamping the ratio.
-        
-        # We use sqrt to align dimensions (Distance vs Distance^2)
-        metric_loss = torch.sqrt(raw_nll + 1e-6)
-        
-        scale = energy_limit / (metric_loss + 1e-6)
-        scale = torch.clamp(scale, max=1.0)
-        
-        # Apply Scale (Detached)
-        # We scale the *original* NLL so gradients are scaled proportionally
-        final_loss = raw_nll * scale.detach()
-        
-        return final_loss.mean()
-
-
-
-
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -396,7 +397,7 @@ class GPT(nn.Module):
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
         ))
-        self.criterion = RiemannianManifoldLoss(config, ignore_index=-1)
+        self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -418,7 +419,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            loss = self.criterion(logits, targets,idx)
+            loss = self.criterion(logits, targets)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
