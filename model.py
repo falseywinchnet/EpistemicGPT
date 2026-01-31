@@ -16,31 +16,35 @@ class LELU(nn.Module):
         return x * torch.sigmoid(self.scale * x)
 
 
+
 class RoPE(nn.Module):
     def __init__(self, dim, max_len=4096):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
 
-        #setfreqs =  torch.logspace(
-        #    start=0,
-        #    end=math.log10(dim),
-        #    steps=dim // 2
-        #) trains faster, but erodes long-context. could be good on some heads?
+        w_max = torch.pi / 2
+        w_min = torch.pi / (max_len)
+        B = 10
+        setfreqs_hi = torch.logspace(
+                    start=math.log(w_min,B),
+                    end=math.log(w_max,B),
+                    steps=(dim // 4),
+                    base=B
+                )
         
+                # Dense Low Frequencies (End)
+                # We invert the logspace to pack density at the 'dim' end
+        setfreqs_lo = w_max - torch.logspace(
+            start=math.log(w_min,B),
+            end=math.log(w_max,B),
+            steps=(dim // 4) + 1,
+            base=B
+        )[:-1] # Drop last to match size
         
-        # Direct calculation without "base" or "ratios"
-        # Log-space boundaries
-        start_log = torch.log(torch.tensor(torch.pi / 2))
-        end_log = torch.log(torch.tensor(2 * torch.pi / max_len))
-        
-        # Interpolate directly in log space
-        # steps should arguably be dim // 2, matching the original snippet's shape
-        log_freqs = torch.linspace(start_log, end_log, steps=dim // 2)
-        
-        # Convert back to linear space
-        # Sort descending=True to match standard RoPE (High Freq at index 0)
-        inv_freq = torch.exp(log_freqs)        
+                # Combine
+        setfreqs = torch.cat((setfreqs_hi, setfreqs_lo))
+        inv_freq, _ = torch.sort(setfreqs,descending=True)
 
         t = torch.arange(max_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
@@ -66,9 +70,11 @@ class RoPE(nn.Module):
         second_half = x[..., midpoint:]
         x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
         x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
+        #this is mainly guesswork. not proven, but applied as best i can.
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
+
 
 
 class MLP(nn.Module):
@@ -200,7 +206,7 @@ class Attention(nn.Module):
             keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
             
             # Apply Dropout
-            #soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
 
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
@@ -306,82 +312,7 @@ class ConstrainedSimplexLoss(nn.Module):
         
         return loss        # This handles the singularity by clamping the ratio.
         
-        # We use sqrt to align dimensions (Distance vs Distance^2)
-        metric_loss = torch.sqrt(raw_nll + 1e-6)
-        
-        scale = energy_limit / (metric_loss + 1e-6)
-        scale = torch.clamp(scale, max=1.0)
-        
-        # Apply Scale (Detached)
-        # We scale the *original* NLL so gradients are scaled proportionally
-        final_loss = raw_nll * scale.detach()
-        
-        return final_loss.mean()
 
-
-
-def _compute_entropic_energy(self, input_ids):
-        """
-        Computes the Wasserstein Energy using Manifold Sketching.
-        INCLUDES ACTIVE MASKING to prevent 'Ghost Bin' model collapse.
-        """
-        B, T = input_ids.shape
-        device = input_ids.device
-        
-        # --- 1. Safe Manifold Sketching ---
-        # Cast to long to prevent overflow
-        hashed_ids = (input_ids.to(torch.long) * 48271) % self.sketch_dim
-        
-        # [B, T, D]
-        sketches = F.one_hot(hashed_ids, num_classes=self.sketch_dim).float()
-
-        # --- 2. NaN-Proof Recency Weights ---
-        indices = torch.arange(T, device=device)
-        raw_dists = (indices.unsqueeze(1) - indices.unsqueeze(0)) + 1.0
-        safe_dists = raw_dists.clamp(min=1.0) # Prevent 1/0
-        mask = torch.tril(torch.ones(T, T, device=device))
-        weights = (1.0 / safe_dists) * mask
-        
-        # --- 3. Vectorized Accumulation ---
-        # [T, T] @ [B, T, D] -> [B, T, D]
-        scores = torch.matmul(weights, sketches)
-        
-        # --- 3.5. ACTIVE MANIFOLD MASKING (The Fix) ---
-        # We identify bins that are NEVER used in this batch sequence.
-        # sketches: [B, T, D] -> sum over T -> [B, D]
-        active_bins = sketches.sum(dim=1) > 0 
-        
-        # We create a mask to set inactive bins to -infinity
-        # This prevents them from stealing probability mass in the Softmax
-        # active_bins shape: [B, D] -> unsqueeze to [B, 1, D] for broadcasting
-        # We want to fill WHERE active_bins is FALSE.
-        neg_inf_mask = ~active_bins.unsqueeze(1)
-
-        # --- 4. Mixture & Energy ---
-        valid_steps = T - 1
-        current_mixtures = scores[:, :valid_steps, :]
-        future_sketches = sketches[:, 1:T, :]
-        
-        mixtures = current_mixtures + future_sketches
-        
-        # APPLY THE MASK BEFORE SOFTMAX
-        # This forces the physics to ignore the "Vacuum" of the sketch space
-        mixtures = mixtures.masked_fill(neg_inf_mask, -1e9)
-        
-        # Normalize
-        distributions = F.softmax(mixtures, dim=-1)
-        
-        d_curr = distributions[:, :-1, :]
-        d_next = distributions[:, 1:, :]
-        
-        # Energy = L1 Norm
-        energy_vec = torch.norm(d_next - d_curr, p=1, dim=-1) 
-        
-        # Prepend initial kick
-        initial = torch.ones(B, 1, device=device)
-        energy_limit = torch.cat([initial, energy_vec], dim=1) 
-        
-        return energy_limit
     
 class GPT(nn.Module):
     def __init__(self, config):
