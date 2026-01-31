@@ -1,3 +1,8 @@
+#copyright 2026 joshuah.rainstar@gmail.com
+#MIT- take this and use it, but please credit me.
+#Version 1.0 EpistemicGPT
+#You can contribute- I need triton code
+
 import math
 import copy
 from dataclasses import dataclass
@@ -10,7 +15,7 @@ import torch.nn.functional as F
 class LELU(nn.Module):
     def __init__(self):
         super().__init__()
-        self.scale = math.pi / math.sqrt(3.0)
+        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
 
     def forward(self, x):
         return x * torch.sigmoid(self.scale * x)
@@ -23,28 +28,29 @@ class RoPE(nn.Module):
         self.dim = dim
         self.max_len = max_len
 
-        w_max = torch.pi / 2
-        w_min = torch.pi / (max_len)
+        w_max = torch.pi / 2 #highest frequency- one rotation in 4 tokens
+        w_min = torch.pi / (max_len) #this sets the lowest scale to that sufficient to resolve needle at depth. 
+        #most effectively, set your context size to more than you ever intend to handle
         B = 10
         setfreqs_hi = torch.logspace(
                     start=math.log(w_min,B),
                     end=math.log(w_max,B),
                     steps=(dim // 4),
                     base=B
-                )
+                ) 
         
-                # Dense Low Frequencies (End)
-                # We invert the logspace to pack density at the 'dim' end
+    
         setfreqs_lo = w_max - torch.logspace(
             start=math.log(w_min,B),
             end=math.log(w_max,B),
             steps=(dim // 4) + 1,
             base=B
-        )[:-1] # Drop last to match size
+        )[:-1] # Drop last to match size and allow a smooth continuation
         
                 # Combine
         setfreqs = torch.cat((setfreqs_hi, setfreqs_lo))
-        inv_freq, _ = torch.sort(setfreqs,descending=True)
+        inv_freq, _ = torch.sort(setfreqs,descending=True) #this give us a sigmoidal distribution of frequencies.
+        #many large, many small, few near the midpoint. 
 
         t = torch.arange(max_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
@@ -70,7 +76,26 @@ class RoPE(nn.Module):
         second_half = x[..., midpoint:]
         x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
         x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
-        #this is mainly guesswork. not proven, but applied as best i can.
+        #this is mainly guesswork. 
+        #the empirically simpler formulation of two slices is insufficient.
+        a more tested formulation looks like:
+        '''
+        def apply_rope_user_half(x, pos, freqs):
+        emb = torch.stack((freqs, freqs), dim=-1).flatten()
+        angles = pos * emb
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        mid = x.shape[-1] // 2
+        h1, h2 = x[..., :mid], x[..., mid:]
+        c1, c2 = cos[..., :mid], cos[..., mid:]
+        s1, s2 = sin[..., :mid], sin[..., mid:]
+
+        # H1: Twist (-90)
+        out_h1 = (rot_inverse(h1) * c1) + (h1 * s1)
+        # H2: Standard (0)
+        out_h2 = (h2 * c2) + (rot_standard(h2) * s2)
+        return torch.cat((out_h1, out_h2), dim=-1)
+        '''
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
@@ -152,8 +177,15 @@ class Attention(nn.Module):
 
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
+
+        #now, why is k a rotation on Q?
+        #ensures k cannot sacrifice to q, q pressures ansi and wants iso
+        #make all a tradeoff. realistically sufficient to pair them- one is lookup into other.
+        #using reflection here instead of a proper aux loss on k to promote iso is for simplification.
+        #the difference has not been ablated.
+        
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-        q = F.rms_norm(q, (D,))
+        q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
@@ -207,6 +239,9 @@ class Attention(nn.Module):
             
             # Apply Dropout
             soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            #what this does is force attention to learn deeper patterns. 
+            #it also dramatically improves needles- it finds needles with same num batches,
+            #despite randomly hiding needles. so it technically sees needle far sooner.
 
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
@@ -218,7 +253,8 @@ class Attention(nn.Module):
         current_mass = attn.sum(dim=-1, keepdim=True)
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
-        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
+        #dont use other kinds of norms on y here
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(y)
@@ -236,6 +272,7 @@ class Block(nn.Module):
     def forward(self, x):  
         y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
         x = norm(x*F.sigmoid(self.gamma) + self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
+        #the purpose of an MLP is to restore structure. 
         return x
 
 @dataclass
