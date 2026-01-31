@@ -60,9 +60,12 @@ class RoPE(nn.Module):
             positions = torch.arange(T, device=x.device)
         
         cos, sin = self.get_embeddings(positions, x.device)
-        
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
+
+        midpoint = x.shape[-1] // 2
+        first_half = x[..., :midpoint]
+        second_half = x[..., midpoint:]
+        x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
+        x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
