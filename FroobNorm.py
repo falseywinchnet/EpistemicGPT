@@ -68,15 +68,9 @@ class AnchorPenaltyInjector(torch.autograd.Function):
         self.rope = RoPE(head_dim)
         
         # --- Configurable Norms on Q and V ---
-        if config_type == "froob":
-            self.q_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
-            self.v_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
-        elif config_type == "rms":
-            self.q_norm = RMSNorm(head_dim)
-            self.v_norm = RMSNorm(head_dim)
-        else: # none
-            self.q_norm = nn.Identity()
-            self.v_norm = nn.Identity()
+        self.q_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
+        self.v_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
+
 
     def get_orthogonal_matrix(self):
         skew = self.skew_basis - self.skew_basis.transpose(-1, -2)
