@@ -145,9 +145,6 @@ class FrobHeadNorm(nn.Module):
 
 
 
-#apply froobnorm + residual highway in your blocks like so:
-#y = x + attn(frob1(x)) #this is an additive update. don't pretend it isnt.
-#x = frobnorm3(x*F.sigmoid(self.gamma*x) + mlp(frob2(y)) #this is a janitor. Don't pretend it isnt.
 class FrobNorm(nn.Module):
     def __init__(self,dim):
         super().__init__()
