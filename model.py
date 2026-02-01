@@ -71,31 +71,9 @@ class RoPE(nn.Module):
         
         cos, sin = self.get_embeddings(positions, x.device)
 
-        midpoint = x.shape[-1] // 2
-        first_half = x[..., :midpoint]
-        second_half = x[..., midpoint:]
-        x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
-        x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
-        #this is mainly guesswork. 
-        #the empirically simpler formulation of two slices is insufficient.
-        a more tested formulation looks like:
-        '''
-        def apply_rope_user_half(x, pos, freqs):
-        emb = torch.stack((freqs, freqs), dim=-1).flatten()
-        angles = pos * emb
-        cos = torch.cos(angles)
-        sin = torch.sin(angles)
-        mid = x.shape[-1] // 2
-        h1, h2 = x[..., :mid], x[..., mid:]
-        c1, c2 = cos[..., :mid], cos[..., mid:]
-        s1, s2 = sin[..., :mid], sin[..., mid:]
+        x1 = x[..., 0::2]
+        x2 = x[..., 1::2]
 
-        # H1: Twist (-90)
-        out_h1 = (rot_inverse(h1) * c1) + (h1 * s1)
-        # H2: Standard (0)
-        out_h2 = (h2 * c2) + (rot_standard(h2) * s2)
-        return torch.cat((out_h1, out_h2), dim=-1)
-        '''
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
@@ -122,14 +100,13 @@ class AnchorPenaltyInjector(torch.autograd.Function):
 class FrobHeadNorm(nn.Module):
     def __init__(self, n_heads, head_dim):
         super().__init__()
-        self.eta = head_dim #seems to be correct, unclear? 16 worked for head dim of 16
-        # Shape: (1, 1, n_heads, head_dim) for easy broadcasting with [B, T, H, D]
-        self.anchor = nn.Parameter(torch.zeros(1, 1, n_heads, head_dim))
+        self.eta = head_dim 
+        # Adjusted for [B, H, T, D] broadcasting
+        self.anchor = nn.Parameter(torch.zeros(1, n_heads, 1, head_dim))
 
     def forward(self, x):
-        # x is [B, T, H, D]
+        # x is [B, H, T, D]
         delta = x - self.anchor
-        # Norm is taken across the head_dim (D)
         radius = torch.norm(delta, p=2, dim=-1, keepdim=True) + 1e-6
         
         if self.training:
@@ -139,8 +116,8 @@ class FrobHeadNorm(nn.Module):
             scale = torch.clamp(self.eta / radius, max=1.0)
             return self.anchor + ((x_conditioned - self.anchor) * scale)
         else:
-            return x
 
+            return x
 
 class FrobNorm(nn.Module):
     def __init__(self,dim):
@@ -259,7 +236,7 @@ class Attention(nn.Module):
         # Soft Attention
         scores = (q @ k.transpose(-2, -1))
         
-        mask = self.mask[:, :, :T, :T]
+        mask = self.mask[:, :, :T, :T].to(device=x.device)
 
         soft_scores = F.softplus(scores)
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
@@ -304,7 +281,7 @@ class Attention(nn.Module):
             keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
             
             # Apply Dropout
-            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            #soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
             #what this does is force attention to learn deeper patterns. 
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
@@ -319,9 +296,8 @@ class Attention(nn.Module):
         current_mass = attn.sum(dim=-1, keepdim=True)
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
-        y = y_context + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
+        y = self.vnorm(y_context) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
         y = y.transpose(1,2).contiguous() #get in b,t,h,d
-        y = self.vnorm(y)
 
         y = y.view(B, T, -1)
 
@@ -333,11 +309,9 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
-        self.gamma = nn.Parameter(torch.ones(1))
-        self.norm = FrobNorm(config.n_embd)
     def forward(self, x):  
-        y = x + self.attn(x) #attention is only ever a diffusive, additive adjustment. 
-        x = self.norm(x*F.sigmoid(self.gamma) + self.mlp(x)) #post-norm in like highway, but only on MLP.
+        x = x + self.attn(x) #attention is only ever a diffusive, additive adjustment. 
+        x = x + self.mlp(x) #post-norm in like highway, but only on MLP.
         #the purpose of an MLP is to restore structure. 
         return x
 
