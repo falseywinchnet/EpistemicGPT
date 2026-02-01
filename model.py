@@ -71,87 +71,46 @@ class RoPE(nn.Module):
         
         cos, sin = self.get_embeddings(positions, x.device)
 
-        x1 = x[..., 0::2]
-        x2 = x[..., 1::2]
+        midpoint = x.shape[-1] // 2
+        first_half = x[..., :midpoint]
+        second_half = x[..., midpoint:]
+        x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
+        x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
+        #this is mainly guesswork. 
+        #the empirically simpler formulation of two slices is insufficient.
+        #a more tested formulation looks like:
+        '''
+        def apply_rope_user_half(x, pos, freqs):
+        emb = torch.stack((freqs, freqs), dim=-1).flatten()
+        angles = pos * emb
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+        mid = x.shape[-1] // 2
+        h1, h2 = x[..., :mid], x[..., mid:]
+        c1, c2 = cos[..., :mid], cos[..., mid:]
+        s1, s2 = sin[..., :mid], sin[..., mid:]
 
+        # H1: Twist (-90)
+        out_h1 = (rot_inverse(h1) * c1) + (h1 * s1)
+        # H2: Standard (0)
+        out_h2 = (h2 * c2) + (rot_standard(h2) * s2)
+        return torch.cat((out_h1, out_h2), dim=-1)
+        '''
         y1 = x1 * cos - x2 * sin
         y2 = x1 * sin + x2 * cos
         return torch.cat((y1, y2), dim=-1)
 
 
 
-class AnchorPenaltyInjector(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, delta, radius, eta, penalty_lambda):
-        ctx.save_for_backward(delta, radius)
-        ctx.eta = eta
-        ctx.penalty_lambda = penalty_lambda
-        return x
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        delta, radius = ctx.saved_tensors
-        violation = torch.relu(radius - ctx.eta)
-        # Gradient points inwards. 
-        # Added small epsilon to denominator to prevent NaN on perfect zeros
-        grad_penalty = (2 * ctx.penalty_lambda * violation / (radius + 1e-6)) * delta
-        return grad_output + grad_penalty, None, None, None, None
-
-class FrobHeadNorm(nn.Module):
-    def __init__(self, n_heads, head_dim):
-        super().__init__()
-        self.eta = head_dim 
-        # Adjusted for [B, H, T, D] broadcasting
-        self.anchor = nn.Parameter(torch.zeros(1, n_heads, 1, head_dim))
-
-    def forward(self, x):
-        # x is [B, H, T, D]
-        delta = x - self.anchor
-        radius = torch.norm(delta, p=2, dim=-1, keepdim=True) + 1e-6
-        
-        if self.training:
-            x_conditioned = AnchorPenaltyInjector.apply(
-                x, delta, radius, self.eta, 1.0
-            )
-            scale = torch.clamp(self.eta / radius, max=1.0)
-            return self.anchor + ((x_conditioned - self.anchor) * scale)
-        else:
-
-            return x
-
-class FrobNorm(nn.Module):
-    def __init__(self,dim):
-        super().__init__()
-        self.eta = dim #seems to be correct, unclear? 16 worked for head dim of 16
-        # Shape: (1, 1, n_heads, head_dim) for easy broadcasting with [B, T, C]
-        self.anchor = nn.Parameter(torch.zeros(1, 1, dim))
-
-    def forward(self, x):
-        # x is [B, T, C]
-        delta = x - self.anchor
-        # Norm is taken across the dim (C)
-        radius = torch.norm(delta, p=2, dim=-1, keepdim=True) + 1e-6
-        
-        if self.training:
-            x_conditioned = AnchorPenaltyInjector.apply(
-                x, delta, radius, self.eta, 1.0
-            )
-            scale = torch.clamp(self.eta / radius, max=1.0)
-            return self.anchor + ((x_conditioned - self.anchor) * scale)
-        else:
-            return x
-            
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.norm = FrobNorm(config.n_embd)
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.act = LELU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.norm(x)
         x = self.c_fc(x)
         x = self.act(x)
         x = self.c_proj(x)
@@ -186,9 +145,7 @@ class Attention(nn.Module):
         #tapering to 0% at halfway.
         self.sd_alpha = getattr(config, 'sd_alpha', 0.3) 
         self.sd_sigma = getattr(config, 'sd_sigma',  limit / 3.0)
-        self.qnorm = FrobHeadNorm(config.n_head, self.head_dim)
-        self.vnorm = FrobHeadNorm(config.n_head, self.head_dim)
-
+        
 
     def get_orthogonal_matrix(self):
         # A = M - M.T (Skew symmetric)
@@ -228,7 +185,7 @@ class Attention(nn.Module):
         #the difference has not been ablated.
         
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-        q = self.qnorm(q) #never ever norm k, you stupid fuck
+        q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
@@ -236,7 +193,7 @@ class Attention(nn.Module):
         # Soft Attention
         scores = (q @ k.transpose(-2, -1))
         
-        mask = self.mask[:, :, :T, :T].to(device=x.device)
+        mask = self.mask[:, :, :T, :T]
 
         soft_scores = F.softplus(scores)
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
@@ -281,7 +238,7 @@ class Attention(nn.Module):
             keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
             
             # Apply Dropout
-            #soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
             #what this does is force attention to learn deeper patterns. 
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
@@ -296,22 +253,25 @@ class Attention(nn.Module):
         current_mass = attn.sum(dim=-1, keepdim=True)
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
-        y = self.vnorm(y_context) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
-        y = y.transpose(1,2).contiguous() #get in b,t,h,d
-
-        y = y.view(B, T, -1)
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
+        #dont use other kinds of norms on y here
+        y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
         return self.o_proj(y)
 
+
+def norm(x):
+    return F.rms_norm(x, (x.size(-1),))
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
+        self.gamma = nn.Parameter(torch.ones(1))
     def forward(self, x):  
-        x = x + self.attn(x) #attention is only ever a diffusive, additive adjustment. 
-        x = x + self.mlp(x) #post-norm in like highway, but only on MLP.
+        y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
+        x = norm(x*F.sigmoid(self.gamma) + self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
         #the purpose of an MLP is to restore structure. 
         return x
 
@@ -410,7 +370,6 @@ class GPT(nn.Module):
         ))
         self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.norm = FrobNorm(config.n_embd)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -423,10 +382,11 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-        x = self.norm(x)
 
         for block in self.transformer.h:
             x = block(x)
+
+        x = norm(x)
 
         if targets is not None:
             logits = self.lm_head(x)
