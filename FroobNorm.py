@@ -138,7 +138,6 @@ class FrobNorm(nn.Module):
     def __init__(self,dim):
         super().__init__()
         self.eta = dim #seems to be correct, unclear? 16 worked for head dim of 16
-        self.penalty_lambda = penalty_lambda
         # Shape: (1, 1, n_heads, head_dim) for easy broadcasting with [B, T, C]
         self.anchor = nn.Parameter(torch.zeros(1, 1, dim))
 
