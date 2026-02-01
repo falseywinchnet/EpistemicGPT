@@ -68,56 +68,69 @@ class AnchorPenaltyInjector(torch.autograd.Function):
         self.rope = RoPE(head_dim)
         
         # --- Configurable Norms on Q and V ---
-        self.q_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
-        self.v_norm = FrobNorm(self.n_heads,head_dim, penalty_lambda=1.0)
+        self.q_norm = FrobNorm(self.n_heads,head_dim)
+        self.v_norm = FrobNorm(self.n_heads,head_dim)
 
 
     def get_orthogonal_matrix(self):
         skew = self.skew_basis - self.skew_basis.transpose(-1, -2)
         return torch.matrix_exp(skew)
 
-    def forward(self, x, force_norm_off=False):
+        
+    def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
-
-        Rs = self.get_orthogonal_matrix()
-        W_q = self.q_proj.weight.view(H, D, C)
+        
+     # Get per-head rotations
+        Rs = self.get_orthogonal_matrix() # [H, D, D]
+        
+        # 1. Reshape q_proj weight to [H, D_h, Dim]
+        W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
+        
+        # 2. Rotate each head's slice of the weight matrix
+        # [H, D, D] @ [H, D, Dim] -> [H, D, Dim]
         W_k_heads = Rs @ W_q
-        W_k = W_k_heads.reshape(H * D, C)
         
-        q = self.q_proj(x).view(B, T, H, D)
-        k = F.linear(x, W_k).view(B, T, H, D)
-        v = self.v_proj(x).view(B, T, H, D)
-
-
-        q = self.q_norm(q)
-        # K is never normed or tampered with
-        #it generates derived from q to begin with, so conditioning on Q impacts conditioning on K
+        # 3. Flatten back to [Dim, Dim] for the linear layer
+        # This effectively constructs a Block-Diagonal W_k
+        W_k = W_k_heads.view(-1, self.n_embd)
         
-        # Apply RoPE
+
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
+        k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
+
+        #now, why is k a rotation on Q?
+        #ensures k cannot sacrifice to q, q pressures ansi and wants iso
+        #make all a tradeoff. realistically sufficient to pair them- one is lookup into other.
+        #using reflection here instead of a proper aux loss on k to promote iso is for simplification.
+        #the difference has not been ablated.
+        
+        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        q = self.qnorm(q) #never ever norm k, you stupid fuck
+
         q = self.rope(q)
         k = self.rope(k)
+    
 
 
 and later :
 
-        out = out.transpose(1, 2).contiguous() # B,T,H,D
         out = self.v_norm(out)
-        out = out.view(B, T, C)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+
         return self.o_proj(out)
         
 '''
 class FrobHeadNorm(nn.Module):
     def __init__(self, n_heads, head_dim):
         super().__init__()
-        self.eta = head_dim #seems to be correct, unclear? 16 worked for head dim of 16
-        # Shape: (1, 1, n_heads, head_dim) for easy broadcasting with [B, T, H, D]
-        self.anchor = nn.Parameter(torch.zeros(1, 1, n_heads, head_dim))
+        self.eta = head_dim 
+        # Adjusted for [B, H, T, D] broadcasting
+        self.anchor = nn.Parameter(torch.zeros(1, n_heads, 1, head_dim))
 
     def forward(self, x):
-        # x is [B, T, H, D]
+        # x is [B, H, T, D]
         delta = x - self.anchor
-        # Norm is taken across the head_dim (D)
         radius = torch.norm(delta, p=2, dim=-1, keepdim=True) + 1e-6
         
         if self.training:
@@ -127,6 +140,7 @@ class FrobHeadNorm(nn.Module):
             scale = torch.clamp(self.eta / radius, max=1.0)
             return self.anchor + ((x_conditioned - self.anchor) * scale)
         else:
+
             return x
 
 
