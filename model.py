@@ -436,6 +436,7 @@ class GPT(nn.Module):
         ))
         self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.norm = FrobNorm(config.n_embd)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -448,11 +449,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
+        x = self.norm(x)
 
         for block in self.transformer.h:
             x = block(x)
-
-        x = norm(x)
 
         if targets is not None:
             logits = self.lm_head(x)
