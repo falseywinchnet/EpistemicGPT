@@ -139,12 +139,9 @@ class Attention(nn.Module):
         self.rope = config.rope
         limit = config.block_size // 2
             
-        # alpha: Max dropout probability (at distance 0/immediate neighbor)
-        #sigma- set here to be half the block size.
-        #so, 30% dropout at the event horizon,
-        #tapering to 0% at halfway.
-        self.sd_alpha = getattr(config, 'sd_alpha', 0.3) 
-        self.sd_sigma = getattr(config, 'sd_sigma',  limit / 3.0)
+   
+        self.sd_alpha = 0.3
+        self.sd_sigma = config.block_size / 2.0
         
 
     def get_orthogonal_matrix(self):
@@ -271,7 +268,7 @@ class Block(nn.Module):
         self.gamma = nn.Parameter(torch.ones(1))
     def forward(self, x):  
         y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
-        x = norm(x*F.sigmoid(self.gamma) + self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
+        x = x+ self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
         #the purpose of an MLP is to restore structure. 
         return x
 
