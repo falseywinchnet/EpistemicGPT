@@ -250,6 +250,11 @@ class Attention(nn.Module):
         current_mass = attn.sum(dim=-1, keepdim=True)
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
+
+        #XSA boost
+        vn = F.normalize(v, dim=-1)
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+        
         y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
         #dont use other kinds of norms on y here
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
