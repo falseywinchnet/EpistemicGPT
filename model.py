@@ -291,40 +291,12 @@ class GPTConfig:
     mask: torch.Tensor = None
 
 class ConstrainedSimplexLoss(nn.Module):
-    """
-    A CrossEntropy wrapper that conditions the gradient descent to the 
-    tangent cone of the probability simplex (Sum(p)=1).
-    Cramer-Rao Bound for Arbitrarily Constrained Sets
 
-    Heedong Do, Member, IEEE, Angel Lozano, Fellow, IEEE
-    
-    Paper alignment:
-    - Enforces the 'span of the tangent cone' constraint[cite: 7, 37].
-    - Applies Projection Matrix Pi derived in Theorem 3[cite: 165].
-    - Valid for singular Fisher Information Matrices common in ML[cite: 6].
-    """
     def __init__(self, vocab_size=66, ignore_index=-1):
         super().__init__()
         self.vocab_size = vocab_size
         self.ignore_index = ignore_index
         
-        # Construct Projection Matrix Pi = I - (1/V) * 11^T
-        # This projects gradients onto the zero-sum subspace (the tangent space of the simplex).
-        I = torch.eye(vocab_size)
-        ones = torch.ones(vocab_size, vocab_size)
-        
-        # Register as a buffer so it saves with the model but doesn't update as a parameter
-        self.register_buffer('Pi', I - (ones / vocab_size))
-
-    def _project_gradient(self, grad):
-        """
-        Backward hook: Projects gradients onto the geometric tangent plane.
-        This ensures updates strictly respect the conservation of probability mass.
-        """
-        # Handle flattened or batched gradients
-        if grad.dim() > 1:
-            return grad @ self.Pi
-        return self.Pi @ grad
 
     def forward(self, logits, targets):
         """
@@ -337,10 +309,6 @@ class ConstrainedSimplexLoss(nn.Module):
         flat_logits = logits.view(-1, self.vocab_size)
         flat_targets = targets.view(-1)
 
-        # 2. Register the geometric constraint hook on the computation graph
-        # This intercepts the backward pass before it reaches the model parameters.
-        if flat_logits.requires_grad:
-            flat_logits.register_hook(self._project_gradient)
 
         # 3. Compute standard CE loss
         loss = F.cross_entropy(
@@ -349,7 +317,7 @@ class ConstrainedSimplexLoss(nn.Module):
             ignore_index=self.ignore_index
         )
         
-        return loss        # This handles the singularity by clamping the ratio.
+        return loss        
         
 
     
