@@ -1,13 +1,13 @@
 #copyright 2026 joshuah.rainstar@gmail.com
 #MIT- take this and use it, but please credit me.
-#Version 1.0 EpistemicGPT
-#You can contribute- I need triton code
+#Version 1.1 EpistemicGPT
+
+
 
 import math
 import copy
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -164,9 +164,10 @@ class Attention(nn.Module):
         self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         
-        self.mask = config.mask
+        self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
+        self.a = 10
             
    
         self.sd_alpha = 0.3
@@ -215,6 +216,8 @@ class Attention(nn.Module):
 
         q = self.rope(q)
         k = self.rope(k)
+        #k = (1 + self.a) * k - self.a * k.detach()
+        #q = (1+ self.a) * q - self.a * q.detach()
     
         # Soft Attention
         scores = (q @ k.transpose(-2, -1))
@@ -264,7 +267,7 @@ class Attention(nn.Module):
             keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
             
             # Apply Dropout
-            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            #soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
             #what this does is force attention to learn deeper patterns. 
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
@@ -316,7 +319,7 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False
     rope: nn.Module = None
-    mask: torch.Tensor = None
+    device: str = "cuda"
 
 class ConstrainedSimplexLoss(nn.Module):
 
@@ -357,15 +360,18 @@ class GPT(nn.Module):
         self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
         self.config.rope = self.rope
 
-        mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size)
-        self.register_buffer("mask", mask_tensor)
-        self.config.mask = self.mask
+
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
         ))
+
+        mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
+        self.register_buffer("mask", mask_tensor)
+        for block in self.transformer.h:
+          block.attn.mask = self.mask #set here
         self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -394,3 +400,20 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens):
+        past_key_values = None
+        for _ in range(max_new_tokens):
+            # If we have cache, we only feed the very last token
+            idx_cond = idx[:, -1:] if past_key_values else idx 
+            
+            # Pass past_key_values explicitly
+            logits, past_key_values = self(idx_cond, targets=None, past_key_values=past_key_values)
+            
+            logits = logits[:, -1, :] 
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
