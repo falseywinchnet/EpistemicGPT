@@ -64,41 +64,70 @@ class RoPE(nn.Module):
         return cos, sin
 
     def forward(self, x, positions=None):
-        # x: (B, H, T, D)
+        # x: (B, H, T, D) where D = self.dim (head_dim)
         if positions is None:
             T = x.shape[-2]
             positions = torch.arange(T, device=x.device)
         
         cos, sin = self.get_embeddings(positions, x.device)
-
-        midpoint = x.shape[-1] // 2
-        first_half = x[..., :midpoint]
-        second_half = x[..., midpoint:]
-        x1 = torch.cat((first_half[..., 0::2], -second_half[..., 1::2]), dim=-1)
-        x2 = torch.cat((-first_half[..., 1::2], second_half[..., 0::2]), dim=-1)
-        #this is mainly guesswork. 
-        #the empirically simpler formulation of two slices is insufficient.
-        #a more tested formulation looks like:
-        '''
-        def apply_rope_user_half(x, pos, freqs):
-        emb = torch.stack((freqs, freqs), dim=-1).flatten()
-        angles = pos * emb
-        cos = torch.cos(angles)
-        sin = torch.sin(angles)
-        mid = x.shape[-1] // 2
-        h1, h2 = x[..., :mid], x[..., mid:]
-        c1, c2 = cos[..., :mid], cos[..., mid:]
-        s1, s2 = sin[..., :mid], sin[..., mid:]
-
-        # H1: Twist (-90)
-        out_h1 = (rot_inverse(h1) * c1) + (h1 * s1)
-        # H2: Standard (0)
-        out_h2 = (h2 * c2) + (rot_standard(h2) * s2)
-        return torch.cat((out_h1, out_h2), dim=-1)
-        '''
-        y1 = x1 * cos - x2 * sin
-        y2 = x1 * sin + x2 * cos
-        return torch.cat((y1, y2), dim=-1)
+        # cos, sin: [1, 1, T, D//2]
+ 
+        D = x.shape[-1]
+        mid = D // 2
+        h1 = x[..., :mid]   # first half of dimensions
+        h2 = x[..., mid:]   # second half of dimensions
+        
+        # Adjacent pairing within each half:
+        # h1 pairs: (h1[0],h1[1]), (h1[2],h1[3]), ...
+        # h2 pairs: (h2[0],h2[1]), (h2[2],h2[3]), ...
+        #
+        # h1 gets sign-flipped convention (sin term adds instead of subtracts)
+        # h2 gets standard convention
+        #
+        # This is achieved by negating the "b" element of each pair in h1
+        # before feeding into the standard rotation formula.
+        
+        # For h1: negate odd-indexed elements, apply rotation, un-negate
+        # Equivalent to: the kernel contribution for h1 pairs becomes
+        #   S * cos(w*d) + A * sin(w*d)
+        # instead of
+        #   S * cos(w*d) - A * sin(w*d)
+        
+        # Extract paired elements for h1
+        h1_a = h1[..., 0::2]   # even indices (the "real" part)
+        h1_b = h1[..., 1::2]   # odd indices (the "imaginary" part)
+        
+        # Extract paired elements for h2
+        h2_a = h2[..., 0::2]
+        h2_b = h2[..., 1::2]
+        
+        # Split cos/sin for the two halves' frequency ranges
+        # First D//4 frequencies go to h1, last D//4 to h2
+        n_pairs_per_half = mid // 2  # D//4
+        cos1 = cos[..., :n_pairs_per_half]
+        sin1 = sin[..., :n_pairs_per_half]
+        cos2 = cos[..., n_pairs_per_half:]
+        sin2 = sin[..., n_pairs_per_half:]
+        
+        # H1: flipped convention (negate b before rotation)
+        # Standard rotation on (a, -b):
+        #   out_a = a * cos - (-b) * sin = a * cos + b * sin
+        #   out_b_neg = a * sin + (-b) * cos = a * sin - b * cos
+        # Then un-negate b: out_b = -(a * sin - b * cos) = -a * sin + b * cos
+        out_h1_a = h1_a * cos1 + h1_b * sin1
+        out_h1_b = -h1_a * sin1 + h1_b * cos1
+        
+        # H2: standard convention
+        #   out_a = a * cos - b * sin
+        #   out_b = a * sin + b * cos
+        out_h2_a = h2_a * cos2 - h2_b * sin2
+        out_h2_b = h2_a * sin2 + h2_b * cos2
+        
+        # Reassemble: interleave a,b back into adjacent pairs
+        out_h1 = torch.stack([out_h1_a, out_h1_b], dim=-1).flatten(-2)
+        out_h2 = torch.stack([out_h2_a, out_h2_b], dim=-1).flatten(-2)
+        
+        return torch.cat([out_h1, out_h2], dim=-1)
 
 
 
@@ -270,10 +299,9 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
-        self.gamma = nn.Parameter(torch.ones(1))
     def forward(self, x):  
         y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
-        x = x+ self.mlp(norm(y))) #post-norm in like highway, but only on MLP.
+        x = x+ self.mlp(norm(y))
         #the purpose of an MLP is to restore structure. 
         return x
 
