@@ -29,7 +29,7 @@ class RoPE(nn.Module):
         self.max_len = max_len
 
         w_max = torch.pi / 2 #highest frequency- one rotation in 4 tokens
-        w_min = torch.pi / (max_len) #this sets the lowest scale to that sufficient to resolve needle at depth. 
+        w_min = torch.pi / (max_len) #this sets the lowest scale to that sufficient to resolve needle at depth.
         #most effectively, set your context size to more than you ever intend to handle
         B = 10
         setfreqs_hi = torch.logspace(
@@ -37,20 +37,20 @@ class RoPE(nn.Module):
                     end=math.log(w_max,B),
                     steps=(dim // 4),
                     base=B
-                ) 
-        
-    
+                )
+
+
         setfreqs_lo = w_max - torch.logspace(
             start=math.log(w_min,B),
             end=math.log(w_max,B),
             steps=(dim // 4) + 1,
             base=B
         )[:-1] # Drop last to match size and allow a smooth continuation
-        
+
                 # Combine
         setfreqs = torch.cat((setfreqs_hi, setfreqs_lo))
         inv_freq, _ = torch.sort(setfreqs,descending=True) #this give us a sigmoidal distribution of frequencies.
-        #many large, many small, few near the midpoint. 
+        #many large, many small, few near the midpoint.
 
         t = torch.arange(max_len).float()
         freqs = torch.einsum('i,j->ij', t, inv_freq)
@@ -68,15 +68,15 @@ class RoPE(nn.Module):
         if positions is None:
             T = x.shape[-2]
             positions = torch.arange(T, device=x.device)
-        
+
         cos, sin = self.get_embeddings(positions, x.device)
         # cos, sin: [1, 1, T, D//2]
- 
+
         D = x.shape[-1]
         mid = D // 2
         h1 = x[..., :mid]   # first half of dimensions
         h2 = x[..., mid:]   # second half of dimensions
-        
+
         # Adjacent pairing within each half:
         # h1 pairs: (h1[0],h1[1]), (h1[2],h1[3]), ...
         # h2 pairs: (h2[0],h2[1]), (h2[2],h2[3]), ...
@@ -86,21 +86,21 @@ class RoPE(nn.Module):
         #
         # This is achieved by negating the "b" element of each pair in h1
         # before feeding into the standard rotation formula.
-        
+
         # For h1: negate odd-indexed elements, apply rotation, un-negate
         # Equivalent to: the kernel contribution for h1 pairs becomes
         #   S * cos(w*d) + A * sin(w*d)
         # instead of
         #   S * cos(w*d) - A * sin(w*d)
-        
+
         # Extract paired elements for h1
         h1_a = h1[..., 0::2]   # even indices (the "real" part)
         h1_b = h1[..., 1::2]   # odd indices (the "imaginary" part)
-        
+
         # Extract paired elements for h2
         h2_a = h2[..., 0::2]
         h2_b = h2[..., 1::2]
-        
+
         # Split cos/sin for the two halves' frequency ranges
         # First D//4 frequencies go to h1, last D//4 to h2
         n_pairs_per_half = mid // 2  # D//4
@@ -108,7 +108,7 @@ class RoPE(nn.Module):
         sin1 = sin[..., :n_pairs_per_half]
         cos2 = cos[..., n_pairs_per_half:]
         sin2 = sin[..., n_pairs_per_half:]
-        
+
         # H1: flipped convention (negate b before rotation)
         # Standard rotation on (a, -b):
         #   out_a = a * cos - (-b) * sin = a * cos + b * sin
@@ -116,17 +116,17 @@ class RoPE(nn.Module):
         # Then un-negate b: out_b = -(a * sin - b * cos) = -a * sin + b * cos
         out_h1_a = h1_a * cos1 + h1_b * sin1
         out_h1_b = -h1_a * sin1 + h1_b * cos1
-        
+
         # H2: standard convention
         #   out_a = a * cos - b * sin
         #   out_b = a * sin + b * cos
         out_h2_a = h2_a * cos2 - h2_b * sin2
         out_h2_b = h2_a * sin2 + h2_b * cos2
-        
+
         # Reassemble: interleave a,b back into adjacent pairs
         out_h1 = torch.stack([out_h1_a, out_h1_b], dim=-1).flatten(-2)
         out_h2 = torch.stack([out_h2_a, out_h2_b], dim=-1).flatten(-2)
-        
+
         return torch.cat([out_h1, out_h2], dim=-1)
 
 
@@ -163,65 +163,73 @@ class Attention(nn.Module):
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-        
+
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
-        self.a = 10
-            
-   
+
         self.sd_alpha = 0.3
         self.sd_sigma = config.block_size / 2.0
-        
+        alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
+        self.register_buffer('k_alpha', alphas)
 
     def get_orthogonal_matrix(self):
         # A = M - M.T (Skew symmetric)
         # We broadcast the transpose over the last two dims
         skew = self.skew_basis - self.skew_basis.transpose(-1, -2)
-        
+
         # Matrix Exp for each head independently
         # Result: [H, D_h, D_h]
         return torch.matrix_exp(skew)
-        
-    def forward(self, x):
+
+    def forward(self, x,new_k):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
         # Get per-head rotations
         Rs = self.get_orthogonal_matrix() # [H, D, D]
-        
+
         # 1. Reshape q_proj weight to [H, D_h, Dim]
         W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
-        
+
         # 2. Rotate each head's slice of the weight matrix
         # [H, D, D] @ [H, D, Dim] -> [H, D, Dim]
         W_k_heads = Rs @ W_q
-        
+
         # 3. Flatten back to [Dim, Dim] for the linear layer
         # This effectively constructs a Block-Diagonal W_k
         W_k = W_k_heads.view(-1, self.n_embd)
-        
 
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
+  
+        
 
         #now, why is k a rotation on Q?
         #ensures k cannot sacrifice to q, q pressures ansi and wants iso
         #make all a tradeoff. realistically sufficient to pair them- one is lookup into other.
         #using reflection here instead of a proper aux loss on k to promote iso is for simplification.
         #the difference has not been ablated.
-        
+
+        # After k is computed and reshaped to (B, H, T, D), before RoPE:
+        half_h = H // 2
+        if new_k is not None:
+             k = self.k_alpha * k + (1 - self.k_alpha) * new_k
+
+        new_k = k.clone() #persist forward the world
+
+
+
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
         q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
-        #k = (1 + self.a) * k - self.a * k.detach()
-        #q = (1+ self.a) * q - self.a * q.detach()
-    
+
+
         # Soft Attention
         scores = (q @ k.transpose(-2, -1))
-        
+
         mask = self.mask[:, :, :T, :T]
 
         soft_scores = F.softplus(scores)
@@ -230,7 +238,7 @@ class Attention(nn.Module):
         threshold = 1e-6
         pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
         soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
-        
+
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
         if self.training:
@@ -239,17 +247,17 @@ class Attention(nn.Module):
             # We only care about positive distances (j <= i), which causal mask handles
             indices = torch.arange(T, device=x.device)
             dist = indices.view(-1, 1) - indices.view(1, -1)
-            
+
             # Gaussian Decay Profile
             # P(drop) is high when dist is small (Recent)
             # P(drop) is low when dist is large (Distant)
             # We clamp dist to 0 to avoid NaNs, though masking handles it
-            
-            
+
+
             # Broadcast probabilities to batch/heads [1, 1, T, T]
             dist = dist.float().clamp(min=0)
             drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
-            
+
             # Align dimensions: [1, 1, T, T]
             drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
 
@@ -259,16 +267,16 @@ class Attention(nn.Module):
             absolute_cutoff_mask = (dist > limit)
             drop_probs = drop_probs.masked_fill(absolute_cutoff_mask, 0.0)
             #Expand BEFORE sampling to ensure atomic independence
-            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls 
+            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls
             # a unique die for every single head and batch item.
             drop_probs_expanded = drop_probs.expand(B, H, T, T)
-            
+
             # Generate Bernoulli Mask on the full tensor
             keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
-            
+
             # Apply Dropout
-            #soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
-            #what this does is force attention to learn deeper patterns. 
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            #what this does is force attention to learn deeper patterns.
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
 
@@ -283,15 +291,16 @@ class Attention(nn.Module):
         residual = 1.0 - F.sigmoid(current_mass)
         y_res = residual * self.v_sink_residual
 
-        #XSA boost
+        #XSA boost by Shuangfei Zhai
+
         vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
-        
+
         y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
         #dont use other kinds of norms on y here
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
 
-        return self.o_proj(y)
+        return self.o_proj(y),new_k
 
 
 def norm(x):
@@ -302,11 +311,12 @@ class Block(nn.Module):
         super().__init__()
         self.attn = Attention(config)
         self.mlp = MLP(config)
-    def forward(self, x):  
-        y = x + self.attn(norm(x)) #attention is only ever a diffusive, additive adjustment. 
+    def forward(self, x,new_k):
+        z, new_k = self.attn(norm(x),new_k)
+        y = x + z #attention is only ever a diffusive, additive adjustment.
         x = x+ self.mlp(norm(y))
-        #the purpose of an MLP is to restore structure. 
-        return x
+        #the purpose of an MLP is to restore structure.
+        return x,new_k
 
 @dataclass
 class GPTConfig:
@@ -314,7 +324,7 @@ class GPTConfig:
     vocab_size: int = 66
     n_layer: int = 4
     n_head: int = 4
-  
+
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False
@@ -327,7 +337,7 @@ class ConstrainedSimplexLoss(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.ignore_index = ignore_index
-        
+
 
     def forward(self, logits, targets):
         """
@@ -343,15 +353,15 @@ class ConstrainedSimplexLoss(nn.Module):
 
         # 3. Compute standard CE loss
         loss = F.cross_entropy(
-            flat_logits, 
-            flat_targets, 
+            flat_logits,
+            flat_targets,
             ignore_index=self.ignore_index
         )
-        
-        return loss        
-        
 
-    
+        return loss
+
+
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -386,9 +396,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
+        new_k = None
 
         for block in self.transformer.h:
-            x = block(x)
+            x,new_k = block(x,new_k)
 
         x = norm(x)
 
@@ -406,14 +417,13 @@ class GPT(nn.Module):
         past_key_values = None
         for _ in range(max_new_tokens):
             # If we have cache, we only feed the very last token
-            idx_cond = idx[:, -1:] if past_key_values else idx 
-            
+            idx_cond = idx[:, -1:] if past_key_values else idx
+
             # Pass past_key_values explicitly
             logits, past_key_values = self(idx_cond, targets=None, past_key_values=past_key_values)
-            
-            logits = logits[:, -1, :] 
+
+            logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
-
