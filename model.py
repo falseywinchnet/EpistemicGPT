@@ -405,7 +405,9 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            loss = self.criterion(logits, targets)
+            logits2 = 5*logits - (4*logits).detach()
+
+            loss = self.criterion(logits2, targets)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
