@@ -1,7 +1,6 @@
 #copyright 2026 joshuah.rainstar@gmail.com
 #MIT- take this and use it, but please credit me.
-#Version 1.1 EpistemicGPT
-
+#Version 1.2 EpistemicGPT
 
 
 import math
@@ -146,6 +145,22 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
+class MLP_bottle(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd,  config.n_embd//2, bias=config.bias)
+        self.act = LELU()
+        self.c_proj  = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -202,8 +217,8 @@ class Attention(nn.Module):
 
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
-  
-        
+
+
 
         #now, why is k a rotation on Q?
         #ensures k cannot sacrifice to q, q pressures ansi and wants iso
@@ -310,13 +325,50 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = Attention(config)
-        self.mlp = MLP(config)
-    def forward(self, x,new_k):
-        z, new_k = self.attn(norm(x),new_k)
-        y = x + z #attention is only ever a diffusive, additive adjustment.
-        x = x+ self.mlp(norm(y))
-        #the purpose of an MLP is to restore structure.
-        return x,new_k
+        self.ffn = MLP(config)
+        self.attn_dir = MLP_bottle(config)
+        self.ffn_dir = MLP_bottle(config)
+
+    def forward(self, x, new_k):
+        z, new_k = self.attn(x, new_k)
+        vn = F.normalize(self.attn_dir(x), dim=-1)
+        q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
+        x = norm(q + z)
+
+        e = self.ffn(x)
+        vn = F.normalize(self.ffn_dir(x), dim=-1)
+        q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
+        x = norm(q + e)
+
+        return x, new_k
+
+#untested: a spectral variant
+'''
+class Block(nn.Module):
+    def __init__(self, config, k=8):
+        super().__init__()
+        self.attn = Attention(config)
+        self.ffn = MLP(config)
+        self.k = k
+
+    def spectral_project(self, x):
+        # x: (B, T, D)
+        G = torch.bmm(x.transpose(1, 2), x)          # (B, D, D)
+        eigvals, eigvecs = torch.linalg.eigh(G)       # ascending order
+        top_k = eigvecs[:, :, -self.k:]                # (B, D, k)
+        proj = torch.bmm(torch.bmm(x, top_k), top_k.transpose(1, 2))  # (B, T, D)
+        return x - proj.detach()
+
+    def forward(self, x, new_k):
+        z, new_k = self.attn(x, new_k)
+        q = self.spectral_project(x)
+        x = norm(q + z)
+
+        e = self.ffn(x)
+        x = norm(x + e)
+
+        return x, new_k
+'''
 
 @dataclass
 class GPTConfig:
@@ -371,7 +423,6 @@ class GPT(nn.Module):
         self.config.rope = self.rope
 
 
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
@@ -398,6 +449,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         new_k = None
 
+        x = norm(x)
         for block in self.transformer.h:
             x,new_k = block(x,new_k)
 
@@ -405,9 +457,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
-            logits2 = 5*logits - (4*logits).detach()
-
-            loss = self.criterion(logits2, targets)
+            loss = self.criterion(logits, targets)
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
