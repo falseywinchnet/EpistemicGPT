@@ -3,7 +3,7 @@
 #Version 1.2 EpistemicGPT
 
 #you imagine a postgrad wrote this. an engineer at a big corporation.
-#but, in fact, the author is presently impoverished and living in missouri.
+#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
 
 import math
 import copy
