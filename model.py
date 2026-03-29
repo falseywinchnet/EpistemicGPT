@@ -2,6 +2,8 @@
 #MIT- take this and use it, but please credit me.
 #Version 1.2 EpistemicGPT
 
+#you imagine a postgrad wrote this. an engineer at a big corporation.
+#but, in fact, the author is presently impoverished and living in missouri.
 
 import math
 import copy
@@ -133,9 +135,9 @@ class RoPE(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc    = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         self.act = LELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(2 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -172,9 +174,11 @@ class Attention(nn.Module):
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
 
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
+
+        self.q_proj = nn.Linear(dim,dim,bias=False)
+        self.v_proj = nn.Linear(dim,dim,bias=False)
+        self.o_proj = nn.Linear(dim,dim,bias=False)
+
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
@@ -187,6 +191,21 @@ class Attention(nn.Module):
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
         self.register_buffer('k_alpha', alphas)
+        self.o_proj = nn.Linear(dim, dim, bias=False)
+        self.p_skew_basis = nn.Parameter(
+            torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
+        )
+        # gate to blend O and P projections -- learned per head
+        self.op_gate = nn.Parameter(torch.zeros(1, self.n_heads, 1, 1))  # sigmoid -> 0.5 init
+
+        # mixing tensor projection: score structure -> directional bias
+        # this is small: head_dim -> head_dim, per-head aware
+        self.mix_proj = nn.Linear(self.head_dim, self.head_dim, bias=False)
+
+
+    def get_p_matrix(self):
+        skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
+        return torch.matrix_exp(skew)
 
     def get_orthogonal_matrix(self):
         # A = M - M.T (Skew symmetric)
@@ -197,7 +216,7 @@ class Attention(nn.Module):
         # Result: [H, D_h, D_h]
         return torch.matrix_exp(skew)
 
-    def forward(self, x,new_k):
+    def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
@@ -219,31 +238,16 @@ class Attention(nn.Module):
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
 
 
-
-        #now, why is k a rotation on Q?
-        #ensures k cannot sacrifice to q, q pressures ansi and wants iso
-        #make all a tradeoff. realistically sufficient to pair them- one is lookup into other.
-        #using reflection here instead of a proper aux loss on k to promote iso is for simplification.
-        #the difference has not been ablated.
-
-        # After k is computed and reshaped to (B, H, T, D), before RoPE:
-        half_h = H // 2
-        if new_k is not None:
-             k = self.k_alpha * k + (1 - self.k_alpha) * new_k
-
-        new_k = k.clone() #persist forward the world
-
-
-
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+
+
         q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
 
-
         # Soft Attention
-        scores = (q @ k.transpose(-2, -1))
+        scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(D))
 
         mask = self.mask[:, :, :T, :T]
 
@@ -300,22 +304,53 @@ class Attention(nn.Module):
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
         attn = soft_scores * scale
         attn = torch.nan_to_num(attn, nan=0.0)
-        y_context = attn @ v
 
+            # ===== Replace everything from y_context = attn @ v onward =====
+
+        y_context = attn @ v  # (B, H, T, D)
+
+        # === Mixing tensor: variance of the attended distribution ===
+        v_sq = attn @ (v * v)  # E[v^2] under attention weights
+        mix_variance = F.relu(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+
+        # Project mix_variance into mixing directions
+        # mix_proj learns to read the variance profile and output the principal mixing axis
+        mix_dir = self.mix_proj(mix_variance)  # (B, H, T, D)
+        mix_dir = F.normalize(mix_dir, dim=-1)
+
+        # === Residual sink ===
         current_mass = attn.sum(dim=-1, keepdim=True)
-        residual = 1.0 - F.sigmoid(current_mass)
-        y_res = residual * self.v_sink_residual
+        residual_weight = 1.0 - F.sigmoid(current_mass)
+        y_res = residual_weight * self.v_sink_residual
 
-        #XSA boost by Shuangfei Zhai
-
+        # === XSA ===
         vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res #the purpose of a sink is to inject structure
-        #dont use other kinds of norms on y here
-        y = y.transpose(1, 2).contiguous().view(B, T, -1)
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res
+        # y is (B, H, T, D)
 
-        return self.o_proj(y),new_k
+        # === O/P decomposition along mixing tensor eigenvectors ===
+        # Decompose y into component along mix_dir and component orthogonal to it
+        # mix_dir is the dominant eigenvector of the mixing stress
+        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir  # projection onto mixing axis
+        y_ortho = y - y_along  # complement
+
+        # Flatten both to (B, T, C) for projection
+        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
+        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
+
+        # O projects the component along the mixing direction
+        # P (orthogonal rotation of O) projects the orthogonal complement
+        Rs_p = self.get_p_matrix()  # (H, D, D)
+        W_o_heads = self.o_proj.weight.view(self.n_heads, self.head_dim, -1)
+        W_p_heads = Rs_p @ W_o_heads
+        W_p = W_p_heads.view(-1, self.n_embd)
+
+        o_out = self.o_proj(y_along_flat)      # mixing-axis content through O
+        p_out = F.linear(y_ortho_flat, W_p)    # orthogonal content through P
+
+        return o_out + p_out
 
 
 def norm(x):
@@ -327,48 +362,20 @@ class Block(nn.Module):
         self.attn = Attention(config)
         self.ffn = MLP(config)
         self.attn_dir = MLP_bottle(config)
-        self.ffn_dir = MLP_bottle(config)
+        self.ffn_dir = config.bottle #shared direction
 
-    def forward(self, x, new_k):
-        z, new_k = self.attn(x, new_k)
-        vn = F.normalize(self.attn_dir(x), dim=-1)
+    def forward(self, x):
+        z =  self.attn(norm( x))
+        vn = F.normalize(self.attn_dir(norm(x)), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = norm(q + z)
+        x = (q + z)
 
-        e = self.ffn(x)
-        vn = F.normalize(self.ffn_dir(x), dim=-1)
+        e = self.ffn(norm(x))
+        vn = F.normalize(self.ffn_dir(norm(x)), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = norm(q + e)
+        x = (q + e)
 
-        return x, new_k
-
-#untested: a spectral variant
-'''
-class Block(nn.Module):
-    def __init__(self, config, k=8):
-        super().__init__()
-        self.attn = Attention(config)
-        self.ffn = MLP(config)
-        self.k = k
-
-    def spectral_project(self, x):
-        # x: (B, T, D)
-        G = torch.bmm(x.transpose(1, 2), x)          # (B, D, D)
-        eigvals, eigvecs = torch.linalg.eigh(G)       # ascending order
-        top_k = eigvecs[:, :, -self.k:]                # (B, D, k)
-        proj = torch.bmm(torch.bmm(x, top_k), top_k.transpose(1, 2))  # (B, T, D)
-        return x - proj.detach()
-
-    def forward(self, x, new_k):
-        z, new_k = self.attn(x, new_k)
-        q = self.spectral_project(x)
-        x = norm(q + z)
-
-        e = self.ffn(x)
-        x = norm(x + e)
-
-        return x, new_k
-'''
+        return x
 
 @dataclass
 class GPTConfig:
@@ -381,38 +388,142 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = False
     rope: nn.Module = None
+    bottle: nn.Module = None
     device: str = "cuda"
 
-class ConstrainedSimplexLoss(nn.Module):
-
-    def __init__(self, vocab_size=66, ignore_index=-1):
+class SoftplusCELoss(nn.Module):
+    def __init__(self, ignore_index=-1, label_smoothing=0.0):
         super().__init__()
-        self.vocab_size = vocab_size
         self.ignore_index = ignore_index
-
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
-        """
-        Args:
-            logits: (Batch, Seq_Len, Vocab) or (Batch, Vocab)
-            targets: (Batch, Seq_Len) or (Batch)
-        """
-        # 1. Flatten for CrossEntropy (matches your snippet's logic)
-        # view(-1, vocab_size) ensures compatibility with (B, T, V) or (B, V)
-        flat_logits = logits.view(-1, self.vocab_size)
+        # logits: (B, V) or (B, T, V)
+        # targets: (B,) or (B, T)
+        flat_logits = logits.view(-1, logits.size(-1))
         flat_targets = targets.view(-1)
 
+        mask = flat_targets != self.ignore_index
+        flat_logits = flat_logits[mask]
+        flat_targets = flat_targets[mask]
 
-        # 3. Compute standard CE loss
-        loss = F.cross_entropy(
-            flat_logits,
-            flat_targets,
-            ignore_index=self.ignore_index
+        if flat_targets.numel() == 0:
+            return flat_logits.sum() * 0.0
+
+        # softplus "probabilities" -- same mechanism as your attention
+        sp = F.softplus(flat_logits)
+
+        threshold = 1e-6
+        pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
+        sp = sp + (pruned - sp).detach()  # STE
+
+        sp_sum = sp.sum(dim=-1, keepdim=True)
+        scale = torch.clamp(1.0 / (sp_sum + 1e-6), max=1.0)
+        probs = sp * scale  # sub-unity simplex
+
+        # gather target probs
+        target_probs = probs.gather(1, flat_targets.unsqueeze(1)).squeeze(1)
+
+        # NLL on the softplus-normalized probs
+        loss = -torch.log(target_probs + 1e-8)
+
+        if self.label_smoothing > 0.0:
+            # smooth term: average negative log-prob across vocab
+            smooth_loss = -torch.log(probs + 1e-8).mean(dim=-1)
+            loss = (1.0 - self.label_smoothing) * loss + self.label_smoothing * smooth_loss
+
+        return loss.mean()
+
+class SubspaceUnembed(nn.Module):
+    def __init__(self, d_model, vocab_size, n_slices=4):
+        super().__init__()
+        self.n_slices = n_slices
+        self.sub_d = d_model // n_slices
+        assert d_model % n_slices == 0
+        
+        # each slice gets its own direction carver and linear
+        self.dir_nets = nn.ModuleList([
+            nn.Linear(d_model, d_model, bias=False)
+            for _ in range(n_slices)
+        ])
+        self.projs = nn.ModuleList([
+            nn.Linear(d_model, vocab_size, bias=False)
+            for _ in range(n_slices)
+        ])
+    
+    def forward(self, h):
+        logits = 0
+        residual = h
+        for i in range(self.n_slices):
+            vn = F.normalize(self.dir_nets[i](h), dim=-1)
+            # carve out component along vn
+            component = (residual * vn).sum(dim=-1, keepdim=True) * vn
+            residual = residual - component
+            # this slice's logit contribution
+            logits = logits + self.projs[i](component)
+        
+        # residual gets default projection through last linear
+        logits = logits + self.projs[-1](residual)
+        return logits
+
+class LayerCache:
+    """Autograd-safe cache using a list internally, pre-allocated buffer for the view."""
+    def __init__(self):
+        self.entries = []
+ 
+    def push(self, x):
+        self.entries.append(x)
+ 
+    def get(self):
+        if len(self.entries) == 0:
+            return None
+        return torch.stack(self.entries, dim=0)  # (N, B, T, D)
+ 
+    def reset(self):
+        self.entries = []
+ 
+ 
+class BlockWithMemory(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_layer = config.n_layer
+        self.res_proj = nn.ParameterList([
+            nn.Parameter(torch.zeros(config.n_embd)) for _ in range(config.n_layer)
+        ])
+ 
+    def softplusmax(self, logits, dim=0):
+        sp = F.softplus(logits)
+        sp = torch.where(sp < 1e-6, torch.zeros_like(sp), sp)
+        sp_sum = sp.sum(dim=dim, keepdim=True)
+        scale = torch.clamp(1.0 / (sp_sum + 1e-6), max=1.0)
+        return sp * scale
+ 
+    def _attn_res(self, x, query, cache_view):
+        V = torch.cat([cache_view, x.unsqueeze(0)], dim=0)  # (N+1, B, T, D)
+        K = F.rms_norm(V, (V.size(-1),))
+        logits = torch.einsum("d, n b t d -> n b t", query, K)
+        weights = self.softplusmax(logits, dim=0)  # (N+1, B, T)
+        return torch.einsum("n b t, n b t d -> b t d", weights, V)
+ 
+    def _block_fn(self, block, x):
+        return block(x)
+ 
+    def forward(self, block, x, i, cache_view):
+        if cache_view is not None:
+            query = self.res_proj[i]
+            x_res = torch.utils.checkpoint.checkpoint(
+                self._attn_res, x, query, cache_view,
+                use_reentrant=False
+            )
+        else:
+            x_res = x
+ 
+        x_out = torch.utils.checkpoint.checkpoint(
+            self._block_fn, block, x_res,
+            use_reentrant=False
         )
-
-        return loss
-
-
+        return x_out
+ 
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -421,7 +532,8 @@ class GPT(nn.Module):
 
         self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
         self.config.rope = self.rope
-
+        self.bottle= MLP_bottle(config)
+        self.config.bottle = self.bottle
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -433,8 +545,12 @@ class GPT(nn.Module):
         self.register_buffer("mask", mask_tensor)
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
-        self.criterion = ConstrainedSimplexLoss(vocab_size=config.vocab_size, ignore_index=-1)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.criterion = SoftplusCELoss(ignore_index=-1)
+        self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size)
+        self.block_mem = BlockWithMemory(config)
+        self.cache = LayerCache()
+
+        
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -447,11 +563,15 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-        new_k = None
 
         x = norm(x)
-        for block in self.transformer.h:
-            x,new_k = block(x,new_k)
+
+
+        self.cache.reset()
+        for i, block in enumerate(self.transformer.h):
+             x = self.block_mem(block, x, i, self.cache.get())
+             self.cache.push(x)
+
 
         x = norm(x)
 
@@ -464,6 +584,13 @@ class GPT(nn.Module):
 
         return logits, loss
 
+
+
+    def softplusmax(logits, temperature=1.0):
+        sp = F.softplus(logits / temperature)
+        sp = torch.where(sp < 1e-6, torch.zeros_like(sp), sp)
+        sp_sum = sp.sum(dim=-1, keepdim=True)
+        return sp * torch.clamp(1.0 / (sp_sum + 1e-6), max=1.0)
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
         past_key_values = None
@@ -475,7 +602,7 @@ class GPT(nn.Module):
             logits, past_key_values = self(idx_cond, targets=None, past_key_values=past_key_values)
 
             logits = logits[:, -1, :]
-            probs = F.softmax(logits, dim=-1)
+            probs = softplusmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx
