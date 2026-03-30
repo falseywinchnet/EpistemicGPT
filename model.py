@@ -523,6 +523,134 @@ class BlockWithMemory(nn.Module):
             use_reentrant=False
         )
         return x_out
+
+
+class Coop5Gate(nn.Module):
+    """
+    Coherence-gated mixer. Evaluates R*C similarity to produce
+    a gate signal, then does an RK2 step from R toward C.
+    Zero learned parameters.
+    """
+    def __init__(self):
+        super().__init__()
+ 
+    @staticmethod
+    def _softsign(x):
+        return x / (1.0 + x.abs())
+ 
+    @staticmethod
+    def _zls(x):
+        sp = F.softplus(x)
+        sa = torch.sigmoid(0.5 * x)
+        ba = sa * (1.0 - sa)
+        return sp - 2.77258872223978123766 * ba
+ 
+    def forward(self, R, C):
+        """
+        R: (B, T, D) evidence (current layer output)
+        C: (B, T, D) context (running mean of previous layers)
+        Returns: mixed (B, T, D)
+        """
+        w = self._zls(
+            self._softsign(R * C).sum(dim=-1, keepdim=True)
+            / (2 * R.size(-1) ** 0.5)
+        )
+        k1 = w * (C - R)
+        k2 = w * (C - (R + 0.5 * k1))
+        return R + 0.25 * (k1 - k2)
+ 
+ 
+# ============================================================
+# NEW: Running Mean Mixer (replaces BlockWithMemory + LayerCache)
+# ============================================================
+ 
+class CoopMeanMixer(nn.Module):
+    """
+    Layers 0,1: no mixing, just accumulate into running mean.
+    Layer 2+: Coop5(layer_output, running_mean), then fold
+              the mixed result into the mean.
+ 
+    The mean is a filtered accumulator: only post-coherence
+    representations enter it. Each layer checks against an
+    increasingly refined consensus.
+ 
+    Zero learned parameters. Replaces BlockWithMemory's
+    per-layer query vectors and full cache attention.
+    """
+    def __init__(self, start_layer=2):
+        super().__init__()
+        self.coop = Coop5Gate()
+        self.start_layer = start_layer
+ 
+    def forward(self, block, x, layer_idx, running_mean, count):
+        """
+        block: the transformer Block to run
+        x: (B, T, D) input to this layer
+        layer_idx: int
+        running_mean: (B, T, D) or None
+        count: int, layers accumulated so far
+ 
+        Returns: (x_out, new_mean, new_count)
+        """
+        if running_mean is None:
+            # First layer: run block, initialize mean from output
+            x_out = torch.utils.checkpoint.checkpoint(
+                lambda b, inp: b(inp), block, x,
+                use_reentrant=False
+            )
+            return x_out, x_out.clone(), 1
+ 
+        if layer_idx < self.start_layer:
+            # Before mixing starts: run block, accumulate raw output
+            x_out = torch.utils.checkpoint.checkpoint(
+                lambda b, inp: b(inp), block, x,
+                use_reentrant=False
+            )
+            new_count = count + 1
+            new_mean = running_mean + (x_out - running_mean) / new_count
+            return x_out, new_mean, new_count
+ 
+        # Layer >= start_layer: mix input with mean, then run block
+        x_mixed = self.coop(x, running_mean)
+        x_out = torch.utils.checkpoint.checkpoint(
+            lambda b, inp: b(inp), block, x_mixed,
+            use_reentrant=False
+        )
+        new_count = count + 1
+        new_mean = running_mean + (x_out - running_mean) / new_count
+        return x_out, new_mean, new_count
+
+
+
+# ============================================================
+# UPDATED GPT.__init__ fragment
+# ============================================================
+# Replace these lines in GPT.__init__:
+#
+#   self.block_mem = BlockWithMemory(config)
+#   self.cache = LayerCache()
+#
+# With:
+#
+#   self.coop_mixer = CoopMeanMixer(start_layer=2)
+ 
+ 
+# ============================================================
+# UPDATED GPT.forward fragment
+# ============================================================
+# Replace this loop in GPT.forward:
+#
+#   self.cache.reset()
+#   for i, block in enumerate(self.transformer.h):
+#        x = self.block_mem(block, x, i, self.cache.get())
+#        self.cache.push(x)
+#
+# With:
+#
+#   running_mean = None
+#   count = 0
+#   for i, block in enumerate(self.transformer.h):
+#       x, running_mean, count = self.coop_mixer(block, x, i, running_mean, count)
  
 
 class GPT(nn.Module):
