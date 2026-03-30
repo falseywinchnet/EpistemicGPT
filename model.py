@@ -2,15 +2,6 @@
 #MIT- take this and use it, but please credit me.
 #Version 1.2 EpistemicGPT
 
-#you imagine a postgrad wrote this. an engineer at a big corporation.
-#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
-#copyright 2026 joshuah.rainstar@gmail.com
-#MIT- take this and use it, but please credit me.
-#Version 1.2 EpistemicGPT
-
-#you imagine a postgrad wrote this. an engineer at a big corporation.
-#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
-
 import math
 import copy
 from dataclasses import dataclass
@@ -186,8 +177,8 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(dim,dim,bias=False)
 
         nn.init.eye_(self.q_proj.weight) # Identity Init
-        self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
-        self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
+        self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
+        self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
@@ -205,7 +196,6 @@ class Attention(nn.Module):
         # mixing tensor projection: score structure -> directional bias
         # this is small: head_dim -> head_dim, per-head aware
         self.mix_proj = nn.Linear(self.head_dim, self.head_dim, bias=False)
-
 
     def get_p_matrix(self):
         skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
@@ -331,7 +321,7 @@ class Attention(nn.Module):
         vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis + y_res
+        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis + y_res
         # y is (B, H, T, D)
 
         # === O/P decomposition along mixing tensor eigenvectors ===
@@ -367,53 +357,34 @@ class Block(nn.Module):
         self.ffn = MLP(config)
         self.attn_dir = MLP_bottle(config)
         self.config = config
-        self.block_idx = block_idx
+        self.ffn_dir = MLP_bottle(config)
         
-        if block_idx > 0:
-            self.ffn_skew_down = nn.Parameter(
-                torch.randn(config.n_embd // 2, config.n_embd // 2) * 0.02
-            )
-            self.ffn_skew_up = nn.Parameter(
-                torch.randn(config.n_embd // 2, config.n_embd // 2) * 0.02
-            )
-    def get_ffn_dir(self, x):
-        base = self.config.bottle
-        
-        if self.block_idx == 0:
-            return base(x)
-        
-        R_down = torch.matrix_exp(self.ffn_skew_down - self.ffn_skew_down.T)
-        R_up = torch.matrix_exp(self.ffn_skew_up - self.ffn_skew_up.T)
-        
-        W_down = R_down @ base.c_fc.weight
-        W_up = base.c_proj.weight @ R_up
-        
-        h = F.linear(x, W_down)
-        h = base.act(h)
-        h = F.linear(h, W_up)
-        return h
+    
     
     def forward(self, x):
-        z = self.attn(norm(x))
-        vn = F.normalize(self.attn_dir(norm(x)), dim=-1)
+
+        a = norm(x)
+        z = self.attn(a)
+        vn = F.normalize(self.attn_dir(a), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
-        e = self.ffn(norm(x))
-        vn = F.normalize(self.get_ffn_dir(norm(x)), dim=-1)
+        s = norm(x)
+        e = self.ffn(s)
+        vn = F.normalize(self.ffn_dir(s), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = q + e
+        x = q + e #want to norm e, but cant. erodes role
 
         return x
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 66
-    n_layer: int = 4
-    n_head: int = 4
+    vocab_size: int = 66 #shakespeare
+    n_layer: int = 1 
+    n_head: int = 6
 
-    n_embd: int = 768
+    n_embd: int = 192 #recommend 32 min per head
     dropout: float = 0.0
     bias: bool = False
     rope: nn.Module = None
@@ -503,9 +474,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
-        self.config.rope = self.rope
-        self.bottle= MLP_bottle(config)
-        self.config.bottle = self.bottle
+
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -535,7 +504,6 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = block(x)            
 
-        x = norm(x)
 
         if targets is not None:
             logits = self.lm_head(x)
