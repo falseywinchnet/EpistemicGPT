@@ -4,6 +4,12 @@
 
 #you imagine a postgrad wrote this. an engineer at a big corporation.
 #but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
+#copyright 2026 joshuah.rainstar@gmail.com
+#MIT- take this and use it, but please credit me.
+#Version 1.2 EpistemicGPT
+
+#you imagine a postgrad wrote this. an engineer at a big corporation.
+#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
 
 import math
 import copy
@@ -191,12 +197,10 @@ class Attention(nn.Module):
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
         self.register_buffer('k_alpha', alphas)
-        self.o_proj = nn.Linear(dim, dim, bias=False)
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
         # gate to blend O and P projections -- learned per head
-        self.op_gate = nn.Parameter(torch.zeros(1, self.n_heads, 1, 1))  # sigmoid -> 0.5 init
 
         # mixing tensor projection: score structure -> directional bias
         # this is small: head_dim -> head_dim, per-head aware
@@ -311,7 +315,7 @@ class Attention(nn.Module):
 
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        mix_variance = F.relu(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
@@ -357,23 +361,48 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, block_idx):
         super().__init__()
         self.attn = Attention(config)
         self.ffn = MLP(config)
         self.attn_dir = MLP_bottle(config)
-        self.ffn_dir = config.bottle #shared direction
-
+        self.config = config
+        self.block_idx = block_idx
+        
+        if block_idx > 0:
+            self.ffn_skew_down = nn.Parameter(
+                torch.randn(config.n_embd // 2, config.n_embd // 2) * 0.02
+            )
+            self.ffn_skew_up = nn.Parameter(
+                torch.randn(config.n_embd // 2, config.n_embd // 2) * 0.02
+            )
+    def get_ffn_dir(self, x):
+        base = self.config.bottle
+        
+        if self.block_idx == 0:
+            return base(x)
+        
+        R_down = torch.matrix_exp(self.ffn_skew_down - self.ffn_skew_down.T)
+        R_up = torch.matrix_exp(self.ffn_skew_up - self.ffn_skew_up.T)
+        
+        W_down = R_down @ base.c_fc.weight
+        W_up = base.c_proj.weight @ R_up
+        
+        h = F.linear(x, W_down)
+        h = base.act(h)
+        h = F.linear(h, W_up)
+        return h
+    
     def forward(self, x):
-        z =  self.attn(norm( x))
+        z = self.attn(norm(x))
         vn = F.normalize(self.attn_dir(norm(x)), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = (q + z)
+        x = q + z
 
         e = self.ffn(norm(x))
-        vn = F.normalize(self.ffn_dir(norm(x)), dim=-1)
+        vn = F.normalize(self.get_ffn_dir(norm(x)), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = (q + e)
+        x = q + e
 
         return x
 
@@ -466,192 +495,7 @@ class SubspaceUnembed(nn.Module):
         logits = logits + self.projs[-1](residual)
         return logits
 
-class LayerCache:
-    """Autograd-safe cache using a list internally, pre-allocated buffer for the view."""
-    def __init__(self):
-        self.entries = []
- 
-    def push(self, x):
-        self.entries.append(x)
- 
-    def get(self):
-        if len(self.entries) == 0:
-            return None
-        return torch.stack(self.entries, dim=0)  # (N, B, T, D)
- 
-    def reset(self):
-        self.entries = []
- 
- 
-class BlockWithMemory(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_layer = config.n_layer
-        self.res_proj = nn.ParameterList([
-            nn.Parameter(torch.zeros(config.n_embd)) for _ in range(config.n_layer)
-        ])
- 
-    def softplusmax(self, logits, dim=0):
-        sp = F.softplus(logits)
-        sp = torch.where(sp < 1e-6, torch.zeros_like(sp), sp)
-        sp_sum = sp.sum(dim=dim, keepdim=True)
-        scale = torch.clamp(1.0 / (sp_sum + 1e-6), max=1.0)
-        return sp * scale
- 
-    def _attn_res(self, x, query, cache_view):
-        V = torch.cat([cache_view, x.unsqueeze(0)], dim=0)  # (N+1, B, T, D)
-        K = F.rms_norm(V, (V.size(-1),))
-        logits = torch.einsum("d, n b t d -> n b t", query, K)
-        weights = self.softplusmax(logits, dim=0)  # (N+1, B, T)
-        return torch.einsum("n b t, n b t d -> b t d", weights, V)
- 
-    def _block_fn(self, block, x):
-        return block(x)
- 
-    def forward(self, block, x, i, cache_view):
-        if cache_view is not None:
-            query = self.res_proj[i]
-            x_res = torch.utils.checkpoint.checkpoint(
-                self._attn_res, x, query, cache_view,
-                use_reentrant=False
-            )
-        else:
-            x_res = x
- 
-        x_out = torch.utils.checkpoint.checkpoint(
-            self._block_fn, block, x_res,
-            use_reentrant=False
-        )
-        return x_out
 
-
-class Coop5Gate(nn.Module):
-    """
-    Coherence-gated mixer. Evaluates R*C similarity to produce
-    a gate signal, then does an RK2 step from R toward C.
-    Zero learned parameters.
-    """
-    def __init__(self):
-        super().__init__()
- 
-    @staticmethod
-    def _softsign(x):
-        return x / (1.0 + x.abs())
- 
-    @staticmethod
-    def _zls(x):
-        sp = F.softplus(x)
-        sa = torch.sigmoid(0.5 * x)
-        ba = sa * (1.0 - sa)
-        return sp - 2.77258872223978123766 * ba
- 
-    def forward(self, R, C):
-        """
-        R: (B, T, D) evidence (current layer output)
-        C: (B, T, D) context (running mean of previous layers)
-        Returns: mixed (B, T, D)
-        """
-        w = self._zls(
-            self._softsign(R * C).sum(dim=-1, keepdim=True)
-            / (2 * R.size(-1) ** 0.5)
-        )
-        k1 = w * (C - R)
-        k2 = w * (C - (R + 0.5 * k1))
-        return R + 0.25 * (k1 - k2)
- 
- 
-# ============================================================
-# NEW: Running Mean Mixer (replaces BlockWithMemory + LayerCache)
-# ============================================================
- 
-class CoopMeanMixer(nn.Module):
-    """
-    Layers 0,1: no mixing, just accumulate into running mean.
-    Layer 2+: Coop5(layer_output, running_mean), then fold
-              the mixed result into the mean.
- 
-    The mean is a filtered accumulator: only post-coherence
-    representations enter it. Each layer checks against an
-    increasingly refined consensus.
- 
-    Zero learned parameters. Replaces BlockWithMemory's
-    per-layer query vectors and full cache attention.
-    """
-    def __init__(self, start_layer=2):
-        super().__init__()
-        self.coop = Coop5Gate()
-        self.start_layer = start_layer
- 
-    def forward(self, block, x, layer_idx, running_mean, count):
-        """
-        block: the transformer Block to run
-        x: (B, T, D) input to this layer
-        layer_idx: int
-        running_mean: (B, T, D) or None
-        count: int, layers accumulated so far
- 
-        Returns: (x_out, new_mean, new_count)
-        """
-        if running_mean is None:
-            # First layer: run block, initialize mean from output
-            x_out = torch.utils.checkpoint.checkpoint(
-                lambda b, inp: b(inp), block, x,
-                use_reentrant=False
-            )
-            return x_out, x_out.clone(), 1
- 
-        if layer_idx < self.start_layer:
-            # Before mixing starts: run block, accumulate raw output
-            x_out = torch.utils.checkpoint.checkpoint(
-                lambda b, inp: b(inp), block, x,
-                use_reentrant=False
-            )
-            new_count = count + 1
-            new_mean = running_mean + (x_out - running_mean) / new_count
-            return x_out, new_mean, new_count
- 
-        # Layer >= start_layer: mix input with mean, then run block
-        x_mixed = self.coop(x, running_mean)
-        x_out = torch.utils.checkpoint.checkpoint(
-            lambda b, inp: b(inp), block, x_mixed,
-            use_reentrant=False
-        )
-        new_count = count + 1
-        new_mean = running_mean + (x_out - running_mean) / new_count
-        return x_out, new_mean, new_count
-
-
-
-# ============================================================
-# UPDATED GPT.__init__ fragment
-# ============================================================
-# Replace these lines in GPT.__init__:
-#
-#   self.block_mem = BlockWithMemory(config)
-#   self.cache = LayerCache()
-#
-# With:
-#
-#   self.coop_mixer = CoopMeanMixer(start_layer=2)
- 
- 
-# ============================================================
-# UPDATED GPT.forward fragment
-# ============================================================
-# Replace this loop in GPT.forward:
-#
-#   self.cache.reset()
-#   for i, block in enumerate(self.transformer.h):
-#        x = self.block_mem(block, x, i, self.cache.get())
-#        self.cache.push(x)
-#
-# With:
-#
-#   running_mean = None
-#   count = 0
-#   for i, block in enumerate(self.transformer.h):
-#       x, running_mean, count = self.coop_mixer(block, x, i, running_mean, count)
- 
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -666,19 +510,14 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(self.config,i) for i in range(config.n_layer)]),
         ))
-
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
         self.register_buffer("mask", mask_tensor)
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size)
-        self.block_mem = BlockWithMemory(config)
-        self.cache = LayerCache()
-
-        
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -691,15 +530,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-
         x = norm(x)
 
-
-        self.cache.reset()
         for i, block in enumerate(self.transformer.h):
-             x = self.block_mem(block, x, i, self.cache.get())
-             self.cache.push(x)
-
+            x = block(x)            
 
         x = norm(x)
 
