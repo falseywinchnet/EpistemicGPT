@@ -1,6 +1,12 @@
 #copyright 2026 joshuah.rainstar@gmail.com
 #MIT- take this and use it, but please credit me.
 #Version 1.2 EpistemicGPT
+#copyright 2026 joshuah.rainstar@gmail.com
+#MIT- take this and use it, but please credit me.
+#Version 1.2 EpistemicGPT
+
+#you imagine a postgrad wrote this. an engineer at a big corporation.
+#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
 
 import math
 import copy
@@ -474,7 +480,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
-
+        self.config.rope = self.rope
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
@@ -514,25 +520,3 @@ class GPT(nn.Module):
 
         return logits, loss
 
-
-
-    def softplusmax(logits, temperature=1.0):
-        sp = F.softplus(logits / temperature)
-        sp = torch.where(sp < 1e-6, torch.zeros_like(sp), sp)
-        sp_sum = sp.sum(dim=-1, keepdim=True)
-        return sp * torch.clamp(1.0 / (sp_sum + 1e-6), max=1.0)
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens):
-        past_key_values = None
-        for _ in range(max_new_tokens):
-            # If we have cache, we only feed the very last token
-            idx_cond = idx[:, -1:] if past_key_values else idx
-
-            # Pass past_key_values explicitly
-            logits, past_key_values = self(idx_cond, targets=None, past_key_values=past_key_values)
-
-            logits = logits[:, -1, :]
-            probs = softplusmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, idx_next), dim=1)
-        return idx
