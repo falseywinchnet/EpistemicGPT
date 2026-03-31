@@ -1,12 +1,7 @@
 #copyright 2026 joshuah.rainstar@gmail.com
 #MIT- take this and use it, but please credit me.
 #Version 1.2 EpistemicGPT
-#copyright 2026 joshuah.rainstar@gmail.com
-#MIT- take this and use it, but please credit me.
-#Version 1.2 EpistemicGPT
 
-#you imagine a postgrad wrote this. an engineer at a big corporation.
-#but, in fact, the author is presently impoverished and living in missouri, where he was born. on a farm. 
 
 import math
 import copy
