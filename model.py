@@ -19,6 +19,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def make_boundary_ste_hook(alpha=1.0):
+    def hook(module, grad_input, grad_output):
+        if not grad_input or not grad_output:
+            return None
+
+        gi = grad_input[0]
+        go = grad_output[0]
+
+        if gi is None or go is None:
+            return None
+        if gi.shape != go.shape:
+            return None
+
+        new_gi = alpha * go + (1.0 - alpha) * gi
+        return (new_gi,) + tuple(grad_input[1:])
+    return hook
+
 class LELU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -433,6 +450,55 @@ class SoftplusCELoss(nn.Module):
 
         return loss.mean()
 
+
+class ResidualRidgeLinearFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, bias, lam):
+        y = F.linear(x, weight, bias)
+        ctx.save_for_backward(x, weight, y)
+        ctx.lam = float(lam)
+        ctx.has_bias = bias is not None
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x, weight, y = ctx.saved_tensors
+        lam = ctx.lam
+
+        ridge = grad_out.pow(2)
+        ridge = ridge / (ridge.mean(dim=-1, keepdim=True) + 1e-8)
+        ridge = 1.0 + lam * ridge
+        grad_used = grad_out * ridge
+
+        grad_x = grad_used @ weight
+
+        x2 = x.reshape(-1, x.shape[-1])
+        g2 = grad_used.reshape(-1, grad_used.shape[-1])
+
+        grad_w = g2.transpose(0, 1) @ x2
+        grad_b = g2.sum(dim=0) if ctx.has_bias else None
+
+        return grad_x, grad_w, grad_b, None
+
+        
+class ResidualRidgeLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, lam=1.0):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.lam = lam
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            bound = 1.0 / math.sqrt(self.weight.shape[1])
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return ResidualRidgeLinearFn.apply(x, self.weight, self.bias, self.lam)
+        
+
 class SubspaceUnembed(nn.Module):
     def __init__(self, d_model, vocab_size, n_slices=4):
         super().__init__()
@@ -445,8 +511,8 @@ class SubspaceUnembed(nn.Module):
             for _ in range(n_slices)
         ])
         self.projs = nn.ModuleList([
-            nn.Linear(d_model, vocab_size, bias=False)
-            for _ in range(n_slices+1)
+             nn.Linear(d_model, vocab_size, bias=False) #todo: swap for ResidualRidgeLinear, perhaps only for one. adapt design. 
+            for _ in range(n_slices + 1)
         ])
 
     def forward(self, h):
@@ -482,10 +548,27 @@ class GPT(nn.Module):
         self.register_buffer("mask", mask_tensor)
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
+
+        self.register_confined_backward(alpha=1.0)
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def register_confined_backward(self, alpha=1.0):
+        #why are you making your model unhappy? 
+        hook = make_boundary_ste_hook(alpha)
+    
+        handles = []
+    
+        for block in self.transformer.h:
+            handles.append(block.attn.register_full_backward_hook(hook))
+            handles.append(block.attn_dir.register_full_backward_hook(hook))
+            #wrap anything that is "stuff->nonlinearity->stuff"
+            #wrap recursively, but dont wrap anything that is "nonlinearty->stuff"
+            #or "stuff->nonlinearity". preserve the ability to learn the adaptation
+
+
 
     def get_num_params(self, non_embedding=True):
         n_params = sum(p.numel() for p in self.parameters())
