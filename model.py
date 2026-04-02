@@ -1,7 +1,14 @@
 #copyright 2026 joshuah.rainstar@gmail.com
 #MIT- take this and use it, but please credit me.
-#Version 1.2 EpistemicGPT
-
+#Version 2.0 EpistemicGPT
+#current notes:
+#your taste whether to use o,p,s mlp on individual products
+#or to use one shared S_mlp on (o_out + p_out + pyong vector)
+#your choice on whether to use the rope i have applied universally or deduce a head-specific frequency
+#your choice on whether to use the Bernoulli learning  approach on all layers or  just a few
+#your choice on whether to key the carving directions in the subspaceunembed to layers or a fixed budget
+#your choice on lelu gelu or some other nonlinearity
+#recommend >32dim per head and to remember that about 60% of avail jacobian directions are exhausted in bookeeping
 
 import math
 import copy
@@ -133,13 +140,11 @@ class RoPE(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 2 * config.n_embd, bias=config.bias)
         self.act = LELU()
-        self.c_proj  = nn.Linear(2 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
         x = self.act(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -176,6 +181,10 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(dim,dim,bias=False)
         self.v_proj = nn.Linear(dim,dim,bias=False)
         self.o_proj = nn.Linear(dim,dim,bias=False)
+        self.s_proj = nn.Linear(dim, dim, bias=False)
+        self.p_mlp = MLP(config)
+        self.o_mlp = MLP(config)
+        self.s_mlp = MLP(config)
 
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
@@ -192,11 +201,7 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
-        # gate to blend O and P projections -- learned per head
 
-        # mixing tensor projection: score structure -> directional bias
-        # this is small: head_dim -> head_dim, per-head aware
-        self.mix_proj = nn.Linear(self.head_dim, self.head_dim, bias=False)
 
     def get_p_matrix(self):
         skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
@@ -310,8 +315,7 @@ class Attention(nn.Module):
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
-        mix_dir = self.mix_proj(mix_variance)  # (B, H, T, D)
-        mix_dir = F.normalize(mix_dir, dim=-1)
+        mix_dir = F.normalize(mix_variance, dim=-1)
 
         # === Residual sink ===
         current_mass = attn.sum(dim=-1, keepdim=True)
@@ -334,6 +338,8 @@ class Attention(nn.Module):
         # Flatten both to (B, T, C) for projection
         y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
         y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
+        poynting = y_along_flat * y_ortho_flat
+  
 
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
@@ -342,10 +348,11 @@ class Attention(nn.Module):
         W_p_heads = Rs_p @ W_o_heads
         W_p = W_p_heads.view(-1, self.n_embd)
 
-        o_out = self.o_proj(y_along_flat)      # mixing-axis content through O
-        p_out = F.linear(y_ortho_flat, W_p)    # orthogonal content through P
+        o__out = self.o_proj(y_along_flat)      # mixing-axis content through O
+        p__out = F.linear(y_ortho_flat, W_p)    # orthogonal content through P
+        s__out = self.s_proj(poynting)      # poynting vector
 
-        return o_out + p_out
+        return self.s_mlp(s__out) + self.p_mlp(p__out) + self.o_mlp(o__out)
 
 
 def norm(x):
@@ -355,13 +362,9 @@ class Block(nn.Module):
     def __init__(self, config, block_idx):
         super().__init__()
         self.attn = Attention(config)
-        self.ffn = MLP(config)
         self.attn_dir = MLP_bottle(config)
         self.config = config
-        self.ffn_dir = MLP_bottle(config)
-        
-    
-    
+
     def forward(self, x):
 
         a = norm(x)
@@ -370,19 +373,13 @@ class Block(nn.Module):
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
-        s = norm(x)
-        e = self.ffn(s)
-        vn = F.normalize(self.ffn_dir(s), dim=-1)
-        q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
-        x = q + e #want to norm e, but cant. erodes role
-
         return x
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 66 #shakespeare
-    n_layer: int = 1 
+    n_layer: int = 1
     n_head: int = 6
 
     n_embd: int = 192 #recommend 32 min per head
@@ -441,30 +438,28 @@ class SubspaceUnembed(nn.Module):
         self.n_slices = n_slices
         self.sub_d = d_model // n_slices
         assert d_model % n_slices == 0
-        
-        # each slice gets its own direction carver and linear
+
         self.dir_nets = nn.ModuleList([
             nn.Linear(d_model, d_model, bias=False)
             for _ in range(n_slices)
         ])
         self.projs = nn.ModuleList([
             nn.Linear(d_model, vocab_size, bias=False)
-            for _ in range(n_slices)
+            for _ in range(n_slices+1)
         ])
-    
+
     def forward(self, h):
         logits = 0
         residual = h
         for i in range(self.n_slices):
             vn = F.normalize(self.dir_nets[i](h), dim=-1)
-            # carve out component along vn
             component = (residual * vn).sum(dim=-1, keepdim=True) * vn
             residual = residual - component
-            # this slice's logit contribution
             logits = logits + self.projs[i](component)
-        
-        # residual gets default projection through last linear
+
+        # Add a new line here
         logits = logits + self.projs[-1](residual)
+
         return logits
 
 
@@ -487,7 +482,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
         self.criterion = SoftplusCELoss(ignore_index=-1)
-        self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size)
+        self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
@@ -500,11 +495,9 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-        x = norm(x)
 
         for i, block in enumerate(self.transformer.h):
-            x = block(x)            
-
+            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
 
         if targets is not None:
             logits = self.lm_head(x)
@@ -514,4 +507,3 @@ class GPT(nn.Module):
             loss = None
 
         return logits, loss
-
