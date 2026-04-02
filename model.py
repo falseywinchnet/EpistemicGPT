@@ -1,14 +1,15 @@
-#copyright 2026 joshuah.rainstar@gmail.com
-#MIT- take this and use it, but please credit me.
+#dedicated to the public domain for the glory of god.
+#baruch adonai el shadddai 
+#Eloheinu shebashamayim yached shimcha v'kayeim malchutecha tamid umloch aleinu le'olam va'ed 
+#2026 joshuah.rainstar@gmail.com
+
 #Version 2.0 EpistemicGPT
 #current notes:
 #your taste whether to use o,p,s mlp on individual products
-#or to use one shared S_mlp on (o_out + p_out + pyong vector)
-#your choice on whether to use the rope i have applied universally or deduce a head-specific frequency
-#your choice on whether to use the Bernoulli learning  approach on all layers or  just a few
-#your choice on whether to key the carving directions in the subspaceunembed to layers or a fixed budget
+#or to use one shared S_mlp on (o_out + p_out + pyong vector). have tried both.
+#your choice on whether to use the Bernoulli learning approach on all layers or just a few
+#your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget
 #your choice on lelu gelu or some other nonlinearity
-#recommend >32dim per head and to remember that about 60% of avail jacobian directions are exhausted in bookeeping
 
 import math
 import copy
