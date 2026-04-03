@@ -10,6 +10,7 @@
 #your choice on whether to use the Bernoulli learning approach on all layers or just a few
 #your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget
 #your choice on lelu gelu or some other nonlinearity
+#figure out some kind of ste alpha decay schedule
 
 import math
 import copy
@@ -450,53 +451,6 @@ class SoftplusCELoss(nn.Module):
 
         return loss.mean()
 
-
-class ResidualRidgeLinearFn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias, lam):
-        y = F.linear(x, weight, bias)
-        ctx.save_for_backward(x, weight, y)
-        ctx.lam = float(lam)
-        ctx.has_bias = bias is not None
-        return y
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        x, weight, y = ctx.saved_tensors
-        lam = ctx.lam
-
-        ridge = grad_out.pow(2)
-        ridge = ridge / (ridge.mean(dim=-1, keepdim=True) + 1e-8)
-        ridge = 1.0 + lam * ridge
-        grad_used = grad_out * ridge
-
-        grad_x = grad_used @ weight
-
-        x2 = x.reshape(-1, x.shape[-1])
-        g2 = grad_used.reshape(-1, grad_used.shape[-1])
-
-        grad_w = g2.transpose(0, 1) @ x2
-        grad_b = g2.sum(dim=0) if ctx.has_bias else None
-
-        return grad_x, grad_w, grad_b, None
-
-        
-class ResidualRidgeLinear(nn.Module):
-    def __init__(self, in_features, out_features, bias=False, lam=1.0):
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_features, in_features))
-        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
-        self.lam = lam
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        if self.bias is not None:
-            bound = 1.0 / math.sqrt(self.weight.shape[1])
-            nn.init.uniform_(self.bias, -bound, bound)
-
-    def forward(self, x):
-        return ResidualRidgeLinearFn.apply(x, self.weight, self.bias, self.lam)
         
 
 class SubspaceUnembed(nn.Module):
@@ -511,7 +465,7 @@ class SubspaceUnembed(nn.Module):
             for _ in range(n_slices)
         ])
         self.projs = nn.ModuleList([
-             nn.Linear(d_model, vocab_size, bias=False) #todo: swap for ResidualRidgeLinear, perhaps only for one. adapt design. 
+             nn.Linear(d_model, vocab_size, bias=False)
             for _ in range(n_slices + 1)
         ])
 
@@ -549,6 +503,7 @@ class GPT(nn.Module):
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
 
+        self._boundary_handles = []
         self.register_confined_backward(alpha=1.0)
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
@@ -556,17 +511,26 @@ class GPT(nn.Module):
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
     def register_confined_backward(self, alpha=1.0):
-        #why are you making your model unhappy? 
         hook = make_boundary_ste_hook(alpha)
-    
         handles = []
     
         for block in self.transformer.h:
             handles.append(block.attn.register_full_backward_hook(hook))
             handles.append(block.attn_dir.register_full_backward_hook(hook))
-            #wrap anything that is "stuff->nonlinearity->stuff"
-            #wrap recursively, but dont wrap anything that is "nonlinearty->stuff"
-            #or "stuff->nonlinearity". preserve the ability to learn the adaptation
+    
+        self._boundary_handles = handles
+        self._confined_alpha = alpha
+        return handles
+
+    def reapply_confined_backward(self, alpha=0.5):
+        #this is checkpointing incompatible at the moment. needs pytorch changes. 
+        if hasattr(self, "_boundary_handles"):
+            for h in self._boundary_handles:
+                h.remove()
+        self._boundary_handles = []
+        
+        self.register_confined_backward(alpha=alpha)
+        
 
 
 
