@@ -205,19 +205,43 @@ class RoPE(nn.Module):
         return torch.cat([out_h1, out_h2], dim=-1)
 
 
+class LELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
 
+    def forward(self, x):
+        return x * torch.sigmoid(self.scale * x)
+
+
+
+class MLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.act = LELU()
+        self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
 
 class MLP_bottle(nn.Module):
     def __init__(self, config):
         super().__init__()
-
-        self.GLU = GLU(config.n_embd,config.n_embd//2)
-
+        self.c_fc    = nn.Linear(config.n_embd,  config.n_embd//2, bias=config.bias)
+        self.act = LELU()
+        self.c_proj  = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        x = self.GLU(x)
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
         return x
-
 def ria_score(x):
     """
     Rectified Integral Activation for attention scores.
@@ -255,9 +279,9 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim,dim,bias=False)
         self.o_proj = nn.Linear(dim,dim,bias=False)
         self.s_proj = nn.Linear(dim, dim, bias=False)
-        self.p_mlp = GLU(dim,dim)
-        self.o_mlp = GLU(dim,dim)
-        self.s_mlp = GLU(dim,dim)
+        self.p_mlp = MLP(config)
+        self.o_mlp = MLP(config)
+        self.s_mlp = MLP(config)
 
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
