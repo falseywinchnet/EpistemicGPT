@@ -205,20 +205,24 @@ class RoPE(nn.Module):
         return torch.cat([out_h1, out_h2], dim=-1)
 
 
-class LELU(nn.Module):
+class LogisticGaussianActivation(nn.Module):
     def __init__(self):
         super().__init__()
-        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
+        self.erf_scale = math.pi / math.sqrt(6.0)
+        self.gate_lo = 0.5 - 1.0 / (2.0 * math.sqrt(3.0))
+        self.gate_range = 1.0 / math.sqrt(3.0)
 
     def forward(self, x):
-        return x * torch.sigmoid(self.scale * x)
-
+        gate_raw = 0.5 * (1.0 + torch.erf(self.erf_scale * x) / math.sqrt(3.0))
+        gate_scaled = (gate_raw - self.gate_lo) / self.gate_range
+        gate = gate_raw + (gate_scaled - gate_raw).detach()
+        return x * gate
 
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.act = LELU()
+        self.act = LogisticGaussianActivation()
         self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -232,7 +236,7 @@ class MLP_bottle(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd,  config.n_embd//2, bias=config.bias)
-        self.act = LELU()
+        self.act = LogisticGaussianActivation()
         self.c_proj  = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
