@@ -74,7 +74,7 @@ class GLU(nn.Module):
  
  
 
-def make_boundary_ste_hook(alpha=0.995):
+def make_boundary_ste_hook(alpha=0.5):
     def hook(module, grad_input, grad_output):
         if not grad_input or not grad_output:
             return None
@@ -254,7 +254,7 @@ def ria_score(x):
     not through the activation.
     """
     #beta = 1.0 / math.sqrt(2.0 * math.pi) #guassian fit, mass of 1.0
-    beta = sqrt(2/pi) # perfect knifes-edge probability assignment
+    beta = math.sqrt(2/math.pi) # perfect knifes-edge probability assignment
     #beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
 
     z = beta * x
@@ -588,7 +588,16 @@ class GPT(nn.Module):
           block.attn.mask = self.mask #set here
 
         self._boundary_handles = []
-        self.register_confined_backward(alpha=1.0)
+        self.register_confined_backward(alpha=0.5)
+        #with alpha 1.0 and around a thousand batches you'll be able
+        #to see what the "floor" of the model is in terms of raw capacity.
+        #but validation loss *will* lag because cooperative eforts will fail
+        #with alpha=0, model is free to basically do whatever it likes.
+        #with 0.5, the model is only allowed to share uncertainty factors.
+        #if pretrained with 1.0 and then lowered to 0.5 or 1.0(note this WILL)
+        #break checkpoints, you can keep the coarse manifold principle direction,
+        #and obtain fine-scale geometric flexibility. That's an option.
+        
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
