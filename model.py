@@ -93,13 +93,13 @@ def make_boundary_ste_hook(alpha=0.5):
 
 
 class RoPE(nn.Module):
-    def __init__(self, dim,max_scale=4096, max_len=4096):
+    def __init__(self, dim, max_len=4096):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
 
         w_max = torch.pi / 2 #highest frequency- one rotation in 4 tokens
-        w_min = torch.pi / (max_scale) #this sets the lowest scale to that sufficient to resolve needle at depth.
+        w_min = torch.pi / (max_len) #this sets the lowest scale to that sufficient to resolve needle at depth.
         #most effectively, set your context size to more than you ever intend to handle
         B = 10
         setfreqs_hi = torch.logspace(
@@ -261,9 +261,60 @@ def ria_score(x):
     return x * 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))) + \
            torch.exp(-0.5 * z * z) / (beta * math.sqrt(2.0 * math.pi))
  
+class PosConditioner(nn.Module):
+    """
+    Positional attention erosion with a continuous knob.
+    
+    knob=0.0 : front taper  - erode recent, force depth    (alpha = base)
+    knob=0.5 : no taper     - mild uniform erosion          (alpha = base/2)
+    knob=1.0 : rear taper   - erode distant, force recency  (alpha = base*2)
+    """
 
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        self.base_alpha = 0.3
+        self.front_sigma = config.block_size / 2.0
+        # Tighter rear sigma: "last few words" safe zone, then rapid falloff
+        self.rear_sigma =  config.block_size / 6.0
+        self.knob=0.5#set in post
+
+    def forward(self, B, H, T, device):
+        indices = torch.arange(T, device=device)
+        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
+        knob = self.knob
+        # Two profiles
+        front = torch.exp(-(dist ** 2) / (2 * self.front_sigma ** 2))   # peaks at dist=0
+        rear  = 1.0 - torch.exp(-(dist ** 2) / (2 * self.rear_sigma ** 2))  # zero at dist=0, rises fast
+
+        # Blend: front -> flat -> rear
+        if knob <= 0.5:
+            t = knob * 2.0          # 0..1 over the first half
+            profile = front * (1.0 - t) + t          # front -> ones
+        else:
+            t = (knob - 0.5) * 2.0  # 0..1 over the second half
+            profile = (1.0 - t) + rear * t            # ones -> rear
+
+        # Alpha: base at 0, base/2 at 0.5, base*2 at 1.0
+        if knob <= 0.5:
+            alpha = self.base_alpha * (1.0 - knob)
+        else:
+            alpha = self.base_alpha * (0.5 + 3.0 * (knob - 0.5))
+
+        drop_probs = (alpha * profile).unsqueeze(0).unsqueeze(0)
+
+        # Protect positions beyond half the sequence from erosion
+        limit = T // 2
+        cutoff = (dist > limit).unsqueeze(0).unsqueeze(0)
+        drop_probs = drop_probs.masked_fill(cutoff, 0.0)
+
+        # Expand then sample -- unique roll per (batch, head, query, key)
+        drop_probs = drop_probs.expand(B, H, T, T)
+        keep_mask = torch.bernoulli(1.0 - drop_probs).bool()
+        return keep_mask
+        
 class Attention(nn.Module):
-    def __init__(self, config,i):
+    def __init__(self, config):
         super().__init__()
         self.n_heads = config.n_head
         self.n_embd = config.n_embd
@@ -281,17 +332,13 @@ class Attention(nn.Module):
         self.p_mlp = MLP(config)
         self.o_mlp = MLP(config)
         self.s_mlp = MLP(config)
-
+        self.erode = PosConditioner(config)
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
 
-        self.mask = None #set in GPT main at model time to ensure its on GPU
-        self.max_scale = int(config.block_size//i)
-
-        self.rope = RoPE(config.n_embd // config.n_head,max_scale=self.max_scale, max_len=config.block_size)
-
-
-        limit =  self.max_scale//2
+        self.mask = None #set in GPT main at model time to ensure its on GPu
+        self.rope = config.rope
+        limit = config.block_size // 2
         #self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
         
         # in forward, clamp to [pi/2, 2pi]
@@ -369,40 +416,8 @@ class Attention(nn.Module):
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
         if self.training:
-            # Create Distance Matrix [T, T]
-            # dist[i, j] = i - j
-            # We only care about positive distances (j <= i), which causal mask handles
-            indices = torch.arange(T, device=x.device)
-            dist = indices.view(-1, 1) - indices.view(1, -1)
-
-            # Gaussian Decay Profile
-            # P(drop) is high when dist is small (Recent)
-            # P(drop) is low when dist is large (Distant)
-            # We clamp dist to 0 to avoid NaNs, though masking handles it
-
-
-            # Broadcast probabilities to batch/heads [1, 1, T, T]
-            dist = dist.float().clamp(min=0)
-            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
-
-            # Align dimensions: [1, 1, T, T]
-            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
-
-            #dont allow damage to the first half, regardless
-            #limited suppot positions do not get eroded
-            limit = T // 2
-            absolute_cutoff_mask = (dist > limit)
-            drop_probs = drop_probs.masked_fill(absolute_cutoff_mask, 0.0)
-            #Expand BEFORE sampling to ensure atomic independence
-            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls
-            # a unique die for every single head and batch item.
-            drop_probs_expanded = drop_probs.expand(B, H, T, T)
-
-            # Generate Bernoulli Mask on the full tensor
-            keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
-
-            # Apply Dropout
-            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
+            keep = self.erode(B, H, T, x.device)
+            soft_scores = soft_scores.masked_fill(~keep, 0.0)
             #what this does is force attention to learn deeper patterns.
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
@@ -466,9 +481,9 @@ def norm(x):
 
 
 class Block(nn.Module):
-    def __init__(self, config, i):
+    def __init__(self, config):
         super().__init__()
-        self.attn = Attention(config,i)
+        self.attn = Attention(config)
         self.attn_dir = MLP_bottle(config)
         self.config = config
 
@@ -577,16 +592,23 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
+        self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
+        self.config.rope = self.rope
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(self.config,config.n_layer-i) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
         ))
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
         self.register_buffer("mask", mask_tensor)
+        i = 0
+        r = np.linspace(1,0,config.n_layer)
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
+          block.attn.erode.knob = r[i]
+          i = i+1
 
         self._boundary_handles = []
         self.register_confined_backward(alpha=0.5)
@@ -604,7 +626,7 @@ class GPT(nn.Module):
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def register_confined_backward(self, alpha=1.0):
+    def register_confined_backward(self, alpha=0.5):
         hook = make_boundary_ste_hook(alpha)
         handles = []
     
