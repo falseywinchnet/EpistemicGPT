@@ -29,6 +29,7 @@ import torch.nn.functional as F
 class LogisticGLU(nn.Module):
     """
     Gated Linear Unit with a logistic-scaled Gaussian gate.
+    # gaussian tricks by Piyush Sao
  
     The gate uses erf scaled by 1/sqrt(3) so the raw output lives in
     (0.5 - 1/(2*sqrt(3)), 0.5 + 1/(2*sqrt(3))) — never reaching 0 or 1.
