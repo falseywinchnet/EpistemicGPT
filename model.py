@@ -293,11 +293,10 @@ class Attention(nn.Module):
         )
     def head_norm(self, x):
         D = x.shape[-1]
-        with torch.no_grad():
-            x_normed = F.rms_norm(x, (D,))
+        x_normed = F.rms_norm(x, (D,))
         rms = x.square().mean(dim=-1, keepdim=True).sqrt()
         antigate = torch.erf(rms * math.pi / math.sqrt(6))
-        return (x + (x_normed - x).detach()) * antigate
+        return x_normed * antigate
 
 
     def get_p_matrix(self):
@@ -449,11 +448,10 @@ class Attention(nn.Module):
 
 def norm(x):
     D = x.size(-1)
-    with torch.no_grad():
-        x_normed = F.rms_norm(x, (D,))
+    x_normed = F.rms_norm(x, (D,))
     rms = x.square().mean(dim=-1, keepdim=True).sqrt()
     antigate = torch.erf(rms * math.pi / math.sqrt(6))
-    return (x + (x_normed - x).detach()) * antigate
+    return x_normed * antigate
 
 
 class Block(nn.Module):
