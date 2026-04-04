@@ -230,8 +230,8 @@ def ria_score(x):
     not through the activation.
     """
     #if beta is None: #default to the gaussian fit
-    beta = 1.0 / math.sqrt(2.0 * math.pi)
-    #beta = 1/sqrt(pi) #if you want it to emulate softplus
+    #beta = 1.0 / math.sqrt(2.0 * math.pi)
+    beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
    # else:
         #beta = (F.softplus(beta)) 
     z = beta * x
@@ -396,11 +396,11 @@ class Attention(nn.Module):
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
-        mix_dir = F.normalize(mix_variance, dim=-1)
+        mix_dir = F.normalize(mix_variance, dim=-1,eps=1e-6)
 
 
         # === XSA ===
-        vn = F.normalize(v, dim=-1)
+        vn = F.normalize(v, dim=-1,eps=1-6)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
         y = self.head_norm(y_context) +self.v_sink_basis
