@@ -290,11 +290,13 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
-    def head_norm(self,x):
-      rms = F.rms_norm(x, (D,))
-      x_normed = x / (rms.detach() + eps)
-      antigate = torch.erf(rms * math.pi / math.sqrt(6))
-      return x_normed * antigate
+    def head_norm(self, x):
+        D = x.shape[-1]
+        with torch.no_grad():
+            x_normed = F.rms_norm(x, (D,))
+        rms = x.square().mean(dim=-1, keepdim=True).sqrt()
+        antigate = torch.erf(rms * math.pi / math.sqrt(6))
+        return (x + (x_normed - x).detach()) * antigate
 
 
     def get_p_matrix(self):
@@ -404,7 +406,7 @@ class Attention(nn.Module):
 
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        mix_variance = ria_score(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
@@ -415,7 +417,7 @@ class Attention(nn.Module):
         vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis
+        y = self.head_norm(y_context) +self.v_sink_basis
         # y is (B, H, T, D)
 
         # === O/P decomposition along mixing tensor eigenvectors ===
@@ -445,10 +447,12 @@ class Attention(nn.Module):
 
 
 def norm(x):
-    rms = F.rms_norm(x, (x.size(-1),))
-    x_normed = x / (rms.detach() + eps)
+    D = x.size(-1)
+    with torch.no_grad():
+        x_normed = F.rms_norm(x, (D,))
+    rms = x.square().mean(dim=-1, keepdim=True).sqrt()
     antigate = torch.erf(rms * math.pi / math.sqrt(6))
-    return x_normed * antigate
+    return (x + (x_normed - x).detach()) * antigate
 
 
 class Block(nn.Module):
