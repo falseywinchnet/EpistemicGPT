@@ -10,6 +10,7 @@
 #your choice on whether to use the Bernoulli learning approach on all layers or just a few
 #your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget
 #your choice on lelu gelu or some other nonlinearity
+#adjust betas on RIA
 #figure out some kind of ste alpha decay schedule
 
 
@@ -26,7 +27,7 @@ import torch.nn.functional as F
 
 
  
-class LogisticGLU(nn.Module):
+class GLU(nn.Module):
     """
     Gated Linear Unit with a logistic-scaled Gaussian gate.
     # gaussian tricks by Piyush Sao
@@ -95,13 +96,6 @@ def make_boundary_ste_hook(alpha=1.0):
         return (new_gi,) + tuple(grad_input[1:])
     return hook
 
-class LELU(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
-
-    def forward(self, x):
-        return x * torch.sigmoid(self.scale * x)
 
 class RoPE(nn.Module):
     def __init__(self, dim, max_len=4096):
@@ -212,32 +206,16 @@ class RoPE(nn.Module):
 
 
 
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.act = LELU()
-        self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.act(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
 
 class MLP_bottle(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd,  config.n_embd//2, bias=config.bias)
-        self.act = LELU()
-        self.c_proj  = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+
+        self.GLU = LogisticGLU(config.n_embd,config.n_embd//2)
+
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.act(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        x = self.GLU(x)
         return x
 
 def ria_score(x):
@@ -277,9 +255,9 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim,dim,bias=False)
         self.o_proj = nn.Linear(dim,dim,bias=False)
         self.s_proj = nn.Linear(dim, dim, bias=False)
-        self.p_mlp = MLP(config)
-        self.o_mlp = MLP(config)
-        self.s_mlp = MLP(config)
+        self.p_mlp = GLU(dim,dim)
+        self.o_mlp = GLU(dim,dim)
+        self.s_mlp = GLU(dim,dim)
 
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
@@ -287,7 +265,7 @@ class Attention(nn.Module):
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
-        self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
+        #self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
         
         # in forward, clamp to [pi/2, 2pi]
         #param = self.ria_param.clamp(math.pi / 2, 2 * math.pi)
