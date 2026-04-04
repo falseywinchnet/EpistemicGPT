@@ -12,6 +12,9 @@
 #your choice on lelu gelu or some other nonlinearity
 #figure out some kind of ste alpha decay schedule
 
+
+
+
 import math
 import copy
 from dataclasses import dataclass
@@ -19,6 +22,57 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+
+ 
+class LogisticGLU(nn.Module):
+    """
+    Gated Linear Unit with a logistic-scaled Gaussian gate.
+ 
+    The gate uses erf scaled by 1/sqrt(3) so the raw output lives in
+    (0.5 - 1/(2*sqrt(3)), 0.5 + 1/(2*sqrt(3))) — never reaching 0 or 1.
+    An affine rescaling maps this to [0, 1] on the forward pass, with a
+    straight-through estimator passing gradients from the unscaled gate.
+ 
+    The erf argument is scaled by pi/sqrt(3) / sqrt(2) = pi/sqrt(6),
+    matching the logistic CDF shape while remaining entire (no complex
+    singularities).
+    """
+ 
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.W = nn.Linear(d_model, d_ff, bias=False)
+        self.W_gate = nn.Linear(d_model, d_ff, bias=False)
+        self.W_out = nn.Linear(d_ff, d_model, bias=False)
+ 
+        # exact constants from the logistic-Gaussian relationship
+        self.register_buffer(
+            'gate_lo', torch.tensor(0.5 - 1.0 / (2.0 * math.sqrt(3)))
+        )
+        self.register_buffer(
+            'gate_hi', torch.tensor(0.5 + 1.0 / (2.0 * math.sqrt(3)))
+        )
+        self.register_buffer(
+            'gate_range', torch.tensor(1.0 / math.sqrt(3))
+        )
+        # pi/sqrt(6) = pi / (sqrt(3) * sqrt(2))
+        self.register_buffer(
+            'erf_scale', torch.tensor(math.pi / math.sqrt(6))
+        )
+ 
+    def forward(self, x):
+        z = self.W_gate(x)
+ 
+        # raw gate in (gate_lo, gate_hi), never 0 or 1
+        gate_raw = 0.5 * (1.0 + torch.erf(self.erf_scale * z) / math.sqrt(3))
+ 
+        # rescale to [0, 1] on forward, straight-through on backward
+        gate_scaled = (gate_raw - self.gate_lo) / self.gate_range
+        gate = gate_raw + (gate_scaled - gate_raw).detach()
+ 
+        return self.W_out(gate * self.W(x))
+ 
 
 def make_boundary_ste_hook(alpha=1.0):
     def hook(module, grad_input, grad_output):
