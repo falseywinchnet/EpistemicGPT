@@ -10,7 +10,6 @@
 #your choice on whether to use the Bernoulli learning approach on all layers or just a few
 #your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget
 #your choice on lelu gelu or some other nonlinearity
-#adjust betas on RIA
 #figure out some kind of ste alpha decay schedule
 
 import math
@@ -21,60 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
- 
-class GLU(nn.Module):
-    """
-    Gated Linear Unit with a logistic-scaled Gaussian gate.
-    # gaussian tricks by Piyush Sao
- 
-    The gate uses erf scaled by 1/sqrt(3) so the raw output lives in
-    (0.5 - 1/(2*sqrt(3)), 0.5 + 1/(2*sqrt(3))) — never reaching 0 or 1.
-    An affine rescaling maps this to [0, 1] on the forward pass, with a
-    straight-th rough estimator passing gradients from the unscaled gate.
- 
-    The erf argument is scaled by pi/sqrt(3) / sqrt(2) = pi/sqrt(6),
-    matching the logistic CDF shape while remaining entire (no complex
-    singularities).
-    """
- 
-    def __init__(self, d_model, d_ff):
-        super().__init__()
-        self.W = nn.Linear(d_model, d_ff, bias=False)
-        self.W_gate = nn.Linear(d_model, d_ff, bias=False)
-        self.W_out = nn.Linear(d_ff, d_model, bias=False)
- 
-        # exact constants from the logistic-Gaussian relationship
-        self.register_buffer(
-            'gate_lo', torch.tensor(0.5 - 1.0 / (2.0 * math.sqrt(3)))
-        )
-        self.register_buffer(
-            'gate_hi', torch.tensor(0.5 + 1.0 / (2.0 * math.sqrt(3)))
-        )
-        self.register_buffer(
-            'gate_range', torch.tensor(1.0 / math.sqrt(3))
-        )
-        # pi/sqrt(6) = pi / (sqrt(3) * sqrt(2))
-        self.register_buffer(
-            'erf_scale', torch.tensor(math.pi / math.sqrt(6))
-        )
- 
-    def forward(self, x):
-        z = self.W_gate(x)
- 
-        # raw gate in (gate_lo, gate_hi), never 0 or 1
-        gate_raw = 0.5 * (1.0 + torch.erf(self.erf_scale * z) / math.sqrt(3))
- 
-        # rescale to [0, 1] on forward, straight-through on backward
-        gate_scaled = (gate_raw - self.gate_lo) / self.gate_range
-        gate = gate_raw + (gate_scaled - gate_raw).detach()
- 
-        return self.W_out(gate * self.W(x))
-
-
- 
- 
-
-def make_boundary_ste_hook(alpha=0.5):
+def make_boundary_ste_hook(alpha=1.0):
     def hook(module, grad_input, grad_output):
         if not grad_input or not grad_output:
             return None
@@ -90,6 +36,15 @@ def make_boundary_ste_hook(alpha=0.5):
         new_gi = alpha * go + (1.0 - alpha) * gi
         return (new_gi,) + tuple(grad_input[1:])
     return hook
+
+class LELU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
+
+    def forward(self, x):
+        return x * torch.sigmoid(self.scale * x)
+
 
 
 class RoPE(nn.Module):
@@ -200,24 +155,11 @@ class RoPE(nn.Module):
         return torch.cat([out_h1, out_h2], dim=-1)
 
 
-class LogisticGaussianActivation(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.erf_scale = math.pi / math.sqrt(6.0)
-        self.gate_lo = 0.5 - 1.0 / (2.0 * math.sqrt(3.0))
-        self.gate_range = 1.0 / math.sqrt(3.0)
-
-    def forward(self, x):
-        gate_raw = 0.5 * (1.0 + torch.erf(self.erf_scale * x) / math.sqrt(3.0))
-        gate_scaled = (gate_raw - self.gate_lo) / self.gate_range
-        gate = gate_raw + (gate_scaled - gate_raw).detach()
-        return x * gate
-
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.act = LogisticGaussianActivation()
+        self.act = LELU()
         self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -231,7 +173,7 @@ class MLP_bottle(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd,  config.n_embd//2, bias=config.bias)
-        self.act = LogisticGaussianActivation()
+        self.act = LELU()
         self.c_proj  = nn.Linear(config.n_embd//2, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
@@ -242,77 +184,7 @@ class MLP_bottle(nn.Module):
         x = self.dropout(x)
         return x
 
-def ria_score(x):
-    """
-    Rectified Integral Activation for attention scores.
-    
-    Entire (no complex singularities), non-negative, asymptotically
-    linear for positive x, Gaussian decay for negative x.
-    
-    beta = 1/sqrt(2*pi): each element at x=0 contributes exactly 1
-    to the total mass. The network learns specificity through Q/K,
-    not through the activation.
-    """
-    #beta = 1.0 / math.sqrt(2.0 * math.pi) #guassian fit, mass of 1.0
-    beta = math.sqrt(2/math.pi) # perfect knifes-edge probability assignment
-    #beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
 
-    z = beta * x
-    return x * 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))) + \
-           torch.exp(-0.5 * z * z) / (beta * math.sqrt(2.0 * math.pi))
- 
-class PosConditioner(nn.Module):
-    """
-    Positional attention erosion with a continuous knob.
-    
-    knob=0.0 : front taper  - erode recent, force depth    (alpha = base)
-    knob=0.5 : no taper     - mild uniform erosion          (alpha = base/2)
-    knob=1.0 : rear taper   - erode distant, force recency  (alpha = base*2)
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.block_size = config.block_size
-        self.base_alpha = 0.3
-        self.front_sigma = config.block_size / 2.0
-        # Tighter rear sigma: "last few words" safe zone, then rapid falloff
-        self.rear_sigma =  config.block_size / 6.0
-        self.knob=0.5#set in post
-
-    def forward(self, B, H, T, device):
-        indices = torch.arange(T, device=device)
-        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
-        knob = self.knob
-        # Two profiles
-        front = torch.exp(-(dist ** 2) / (2 * self.front_sigma ** 2))   # peaks at dist=0
-        rear  = 1.0 - torch.exp(-(dist ** 2) / (2 * self.rear_sigma ** 2))  # zero at dist=0, rises fast
-
-        # Blend: front -> flat -> rear
-        if knob <= 0.5:
-            t = knob * 2.0          # 0..1 over the first half
-            profile = front * (1.0 - t) + t          # front -> ones
-        else:
-            t = (knob - 0.5) * 2.0  # 0..1 over the second half
-            profile = (1.0 - t) + rear * t            # ones -> rear
-
-        # Alpha: base at 0, base/2 at 0.5, base*2 at 1.0
-        if knob <= 0.5:
-            alpha = self.base_alpha * (1.0 - knob)
-        else:
-            alpha = self.base_alpha * (0.5 + 3.0 * (knob - 0.5))
-
-        drop_probs = (alpha * profile).unsqueeze(0).unsqueeze(0)
-
-        # Protect positions beyond half the sequence from erosion
-        limit = T // 2
-        cutoff = (dist > limit).unsqueeze(0).unsqueeze(0)
-        drop_probs = drop_probs.masked_fill(cutoff, 0.0)
-
-        # Expand then sample -- unique roll per (batch, head, query, key)
-        drop_probs = drop_probs.expand(B, H, T, T)
-        keep_mask = torch.bernoulli(1.0 - drop_probs).bool()
-        return keep_mask
-        
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -332,21 +204,15 @@ class Attention(nn.Module):
         self.p_mlp = MLP(config)
         self.o_mlp = MLP(config)
         self.s_mlp = MLP(config)
-        self.erode = PosConditioner(config)
+
         nn.init.eye_(self.q_proj.weight) # Identity Init
+        self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
 
-        self.mask = None #set in GPT main at model time to ensure its on GPu
+        self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
-        #self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
-        
-        # in forward, clamp to [pi/2, 2pi]
-        #param = self.ria_param.clamp(math.pi / 2, 2 * math.pi)
-        #beta = 1.0 / param.sqrt()
-        #todo: head-specific sharpening options
-        
-        
+
         self.sd_alpha = 0.3
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
@@ -354,10 +220,7 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
-    def head_norm(self, x):
-        D = x.shape[-1]
-        x_normed = F.rms_norm(x, (D,), eps=1e-6)
-        return x_normed
+
 
     def get_p_matrix(self):
         skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
@@ -396,7 +259,8 @@ class Attention(nn.Module):
 
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
-        q = self.head_norm(q) #never ever norm k, you stupid fuck
+
+        q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
@@ -406,7 +270,7 @@ class Attention(nn.Module):
 
         mask = self.mask[:, :, :T, :T]
 
-        soft_scores = ria_score(scores)
+        soft_scores = F.softplus(scores)
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
         threshold = 1e-6
@@ -416,8 +280,40 @@ class Attention(nn.Module):
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
         if self.training:
-            keep = self.erode(B, H, T, x.device)
-            soft_scores = soft_scores.masked_fill(~keep, 0.0)
+            # Create Distance Matrix [T, T]
+            # dist[i, j] = i - j
+            # We only care about positive distances (j <= i), which causal mask handles
+            indices = torch.arange(T, device=x.device)
+            dist = indices.view(-1, 1) - indices.view(1, -1)
+
+            # Gaussian Decay Profile
+            # P(drop) is high when dist is small (Recent)
+            # P(drop) is low when dist is large (Distant)
+            # We clamp dist to 0 to avoid NaNs, though masking handles it
+
+
+            # Broadcast probabilities to batch/heads [1, 1, T, T]
+            dist = dist.float().clamp(min=0)
+            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
+
+            # Align dimensions: [1, 1, T, T]
+            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
+
+            #dont allow damage to the first half, regardless
+            #limited suppot positions do not get eroded
+            limit = T // 2
+            absolute_cutoff_mask = (dist > limit)
+            drop_probs = drop_probs.masked_fill(absolute_cutoff_mask, 0.0)
+            #Expand BEFORE sampling to ensure atomic independence
+            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls
+            # a unique die for every single head and batch item.
+            drop_probs_expanded = drop_probs.expand(B, H, T, T)
+
+            # Generate Bernoulli Mask on the full tensor
+            keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
+
+            # Apply Dropout
+            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
             #what this does is force attention to learn deeper patterns.
             #it also dramatically improves needles- it finds needles with same num batches,
             #despite randomly hiding needles. so it technically sees needle far sooner.
@@ -434,18 +330,22 @@ class Attention(nn.Module):
 
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        mix_variance = ria_score(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
-        mix_dir = F.normalize(mix_variance, dim=-1,eps=1e-6)
+        mix_dir = F.normalize(mix_variance, dim=-1)
 
+        # === Residual sink ===
+        current_mass = attn.sum(dim=-1, keepdim=True)
+        residual_weight = 1.0 - F.sigmoid(current_mass)
+        y_res = residual_weight * self.v_sink_residual
 
         # === XSA ===
-        vn = F.normalize(v, dim=-1,eps=1-6)
+        vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = self.head_norm(y_context) +self.v_sink_basis
+        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis + y_res
         # y is (B, H, T, D)
 
         # === O/P decomposition along mixing tensor eigenvectors ===
@@ -475,13 +375,10 @@ class Attention(nn.Module):
 
 
 def norm(x):
-    D = x.size(-1)
-    x_normed = F.rms_norm(x, (D,), eps=1e-6)
-    return x_normed #* antigate
-
+    return F.rms_norm(x, (x.size(-1),))
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, block_idx):
         super().__init__()
         self.attn = Attention(config)
         self.attn_dir = MLP_bottle(config)
@@ -491,7 +388,7 @@ class Block(nn.Module):
 
         a = norm(x)
         z = self.attn(a)
-        vn = F.normalize(self.attn_dir(a), dim=-1,eps=1e-6)
+        vn = F.normalize(self.attn_dir(a), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
@@ -530,8 +427,8 @@ class SoftplusCELoss(nn.Module):
         if flat_targets.numel() == 0:
             return flat_logits.sum() * 0.0
 
-
-        sp = ria_score(flat_logits)
+        # softplus "probabilities" -- same mechanism as your attention
+        sp = F.softplus(flat_logits)
 
         threshold = 1e-6
         pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
@@ -576,7 +473,7 @@ class SubspaceUnembed(nn.Module):
         logits = 0
         residual = h
         for i in range(self.n_slices):
-            vn = F.normalize(self.dir_nets[i](h), dim=-1,eps=1e-6)
+            vn = F.normalize(self.dir_nets[i](h), dim=-1)
             component = (residual * vn).sum(dim=-1, keepdim=True) * vn
             residual = residual - component
             logits = logits + self.projs[i](component)
@@ -592,41 +489,28 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        
+
         self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
         self.config.rope = self.rope
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(self.config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(self.config,i) for i in range(config.n_layer)]),
         ))
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
         self.register_buffer("mask", mask_tensor)
-        i = 0
-        r = np.linspace(1,0,config.n_layer)
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
-          block.attn.erode.knob = r[i]
-          i = i+1
 
         self._boundary_handles = []
-        self.register_confined_backward(alpha=0.5)
-        #with alpha 1.0 and around a thousand batches you'll be able
-        #to see what the "floor" of the model is in terms of raw capacity.
-        #but validation loss *will* lag because cooperative eforts will fail
-        #with alpha=0, model is free to basically do whatever it likes.
-        #with 0.5, the model is only allowed to share uncertainty factors.
-        #if pretrained with 1.0 and then lowered to 0.5 or 1.0(note this WILL)
-        #break checkpoints, you can keep the coarse manifold principle direction,
-        #and obtain fine-scale geometric flexibility. That's an option.
-
+        self.register_confined_backward(alpha=1.0)
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def register_confined_backward(self, alpha=0.5):
+    def register_confined_backward(self, alpha=1.0):
         hook = make_boundary_ste_hook(alpha)
         handles = []
     
@@ -661,7 +545,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
 
         for i, block in enumerate(self.transformer.h):
-            x = block(x)
+            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
 
         if targets is not None:
             logits = self.lm_head(x)
