@@ -102,8 +102,6 @@ class LELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.scale * x)
 
-
-
 class RoPE(nn.Module):
     def __init__(self, dim, max_len=4096):
         super().__init__()
@@ -263,7 +261,6 @@ class Attention(nn.Module):
         self.s_mlp = MLP(config)
 
         nn.init.eye_(self.q_proj.weight) # Identity Init
-        self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
@@ -397,16 +394,12 @@ class Attention(nn.Module):
         # mix_proj learns to read the variance profile and output the principal mixing axis
         mix_dir = F.normalize(mix_variance, dim=-1)
 
-        # === Residual sink ===
-        current_mass = attn.sum(dim=-1, keepdim=True)
-        residual_weight = 1.0 - F.sigmoid(current_mass)
-        y_res = residual_weight * self.v_sink_residual
 
         # === XSA ===
         vn = F.normalize(v, dim=-1)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis + y_res
+        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis
         # y is (B, H, T, D)
 
         # === O/P decomposition along mixing tensor eigenvectors ===
