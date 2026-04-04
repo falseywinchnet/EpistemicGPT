@@ -239,6 +239,22 @@ class MLP_bottle(nn.Module):
         x = self.dropout(x)
         return x
 
+def ria_score(x):
+    """
+    Rectified Integral Activation for attention scores.
+    
+    Entire (no complex singularities), non-negative, asymptotically
+    linear for positive x, Gaussian decay for negative x.
+    
+    beta = 1/sqrt(2*pi): each element at x=0 contributes exactly 1
+    to the total mass. The network learns specificity through Q/K,
+    not through the activation.
+    """
+    beta = 1.0 / math.sqrt(2.0 * math.pi)
+    z = beta * x
+    return x * 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))) + \
+           torch.exp(-0.5 * z * z) / (beta * math.sqrt(2.0 * math.pi))
+ 
 
 class Attention(nn.Module):
     def __init__(self, config):
@@ -328,7 +344,7 @@ class Attention(nn.Module):
 
         mask = self.mask[:, :, :T, :T]
 
-        soft_scores = F.softplus(scores)
+        soft_scores = ria_score(scores)
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
         threshold = 1e-6
@@ -485,8 +501,8 @@ class SoftplusCELoss(nn.Module):
         if flat_targets.numel() == 0:
             return flat_logits.sum() * 0.0
 
-        # softplus "probabilities" -- same mechanism as your attention
-        sp = F.softplus(flat_logits)
+
+        sp = ria_score(flat_logits)
 
         threshold = 1e-6
         pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
