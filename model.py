@@ -251,7 +251,11 @@ def ria_score(x):
     to the total mass. The network learns specificity through Q/K,
     not through the activation.
     """
+    #if beta is None: #default to the gaussian fit
     beta = 1.0 / math.sqrt(2.0 * math.pi)
+    #beta = 1/sqrt(pi) #if you want it to emulate softplus
+   # else:
+        #beta = (F.softplus(beta)) 
     z = beta * x
     return x * 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))) + \
            torch.exp(-0.5 * z * z) / (beta * math.sqrt(2.0 * math.pi))
@@ -283,7 +287,14 @@ class Attention(nn.Module):
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
-
+        self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
+        
+        # in forward, clamp to [pi/2, 2pi]
+        #param = self.ria_param.clamp(math.pi / 2, 2 * math.pi)
+        #beta = 1.0 / param.sqrt()
+        #todo: head-specific sharpening options
+        
+        
         self.sd_alpha = 0.3
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
@@ -293,11 +304,8 @@ class Attention(nn.Module):
         )
     def head_norm(self, x):
         D = x.shape[-1]
-        x_normed = F.rms_norm(x, (D,))
-        rms = x.square().mean(dim=-1, keepdim=True).sqrt()
-        antigate = torch.erf(rms * math.pi / math.sqrt(6))
-        return x_normed * antigate
-
+        x_normed = F.rms_norm(x, (D,), eps=1e-6)
+        return x_normed
 
     def get_p_matrix(self):
         skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
@@ -448,10 +456,8 @@ class Attention(nn.Module):
 
 def norm(x):
     D = x.size(-1)
-    x_normed = F.rms_norm(x, (D,))
-    rms = x.square().mean(dim=-1, keepdim=True).sqrt()
-    antigate = torch.erf(rms * math.pi / math.sqrt(6))
-    return x_normed * antigate
+    x_normed = F.rms_norm(x, (D,), eps=1e-6)
+    return x_normed #* antigate
 
 
 class Block(nn.Module):
@@ -465,7 +471,7 @@ class Block(nn.Module):
 
         a = norm(x)
         z = self.attn(a)
-        vn = F.normalize(self.attn_dir(a), dim=-1)
+        vn = F.normalize(self.attn_dir(a), dim=-1,eps=1e-6)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
@@ -550,7 +556,7 @@ class SubspaceUnembed(nn.Module):
         logits = 0
         residual = h
         for i in range(self.n_slices):
-            vn = F.normalize(self.dir_nets[i](h), dim=-1)
+            vn = F.normalize(self.dir_nets[i](h), dim=-1,eps=1e-6)
             component = (residual * vn).sum(dim=-1, keepdim=True) * vn
             residual = residual - component
             logits = logits + self.projs[i](component)
