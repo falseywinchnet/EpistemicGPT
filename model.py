@@ -72,6 +72,9 @@ class LogisticGLU(nn.Module):
         gate = gate_raw + (gate_scaled - gate_raw).detach()
  
         return self.W_out(gate * self.W(x))
+
+
+ 
  
 
 def make_boundary_ste_hook(alpha=1.0):
@@ -274,6 +277,11 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
+    def head_norm(self,x):
+      rms = F.rms_norm(x, (D,))
+      x_normed = x / (rms.detach() + eps)
+      antigate = torch.erf(rms * math.pi / math.sqrt(6))
+      return x_normed * antigate
 
 
     def get_p_matrix(self):
@@ -313,8 +321,7 @@ class Attention(nn.Module):
 
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
-
-        q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
+        q = self.head_norm(q) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
@@ -429,7 +436,11 @@ class Attention(nn.Module):
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+    rms = F.rms_norm(x, (x.size(-1),))
+    x_normed = x / (rms.detach() + eps)
+    antigate = torch.erf(rms * math.pi / math.sqrt(6))
+    return x_normed * antigate
+
 
 class Block(nn.Module):
     def __init__(self, config, block_idx):
