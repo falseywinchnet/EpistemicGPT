@@ -13,9 +13,6 @@
 #adjust betas on RIA
 #figure out some kind of ste alpha decay schedule
 
-
-
-
 import math
 import copy
 from dataclasses import dataclass
@@ -23,8 +20,6 @@ from typing import Optional, Tuple, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
 
  
 class GLU(nn.Module):
@@ -35,7 +30,7 @@ class GLU(nn.Module):
     The gate uses erf scaled by 1/sqrt(3) so the raw output lives in
     (0.5 - 1/(2*sqrt(3)), 0.5 + 1/(2*sqrt(3))) — never reaching 0 or 1.
     An affine rescaling maps this to [0, 1] on the forward pass, with a
-    straight-through estimator passing gradients from the unscaled gate.
+    straight-th rough estimator passing gradients from the unscaled gate.
  
     The erf argument is scaled by pi/sqrt(3) / sqrt(2) = pi/sqrt(6),
     matching the logistic CDF shape while remaining entire (no complex
@@ -79,7 +74,7 @@ class GLU(nn.Module):
  
  
 
-def make_boundary_ste_hook(alpha=1.0):
+def make_boundary_ste_hook(alpha=0.995):
     def hook(module, grad_input, grad_output):
         if not grad_input or not grad_output:
             return None
@@ -246,6 +241,7 @@ class MLP_bottle(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+
 def ria_score(x):
     """
     Rectified Integral Activation for attention scores.
@@ -257,11 +253,10 @@ def ria_score(x):
     to the total mass. The network learns specificity through Q/K,
     not through the activation.
     """
-    #if beta is None: #default to the gaussian fit
-    beta = 1.0 / math.sqrt(2.0 * math.pi)
+    #beta = 1.0 / math.sqrt(2.0 * math.pi) #guassian fit, mass of 1.0
+    beta = sqrt(2/pi) # perfect knifes-edge probability assignment
     #beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
-   # else:
-        #beta = (F.softplus(beta)) 
+
     z = beta * x
     return x * 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0))) + \
            torch.exp(-0.5 * z * z) / (beta * math.sqrt(2.0 * math.pi))
