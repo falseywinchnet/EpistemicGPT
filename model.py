@@ -1,5 +1,5 @@
 #dedicated to the public domain for the glory of god.
-#baruch adonai el shadddai 
+#baruch adonai el shaddai 
 #Eloheinu shebashamayim yached shimcha v'kayeim malchutecha tamid umloch aleinu le'olam va'ed 
 #2026 joshuah.rainstar@gmail.com
 
@@ -93,13 +93,13 @@ def make_boundary_ste_hook(alpha=0.5):
 
 
 class RoPE(nn.Module):
-    def __init__(self, dim, max_len=4096):
+    def __init__(self, dim,max_scale=4096, max_len=4096):
         super().__init__()
         self.dim = dim
         self.max_len = max_len
 
         w_max = torch.pi / 2 #highest frequency- one rotation in 4 tokens
-        w_min = torch.pi / (max_len) #this sets the lowest scale to that sufficient to resolve needle at depth.
+        w_min = torch.pi / (max_scale) #this sets the lowest scale to that sufficient to resolve needle at depth.
         #most effectively, set your context size to more than you ever intend to handle
         B = 10
         setfreqs_hi = torch.logspace(
@@ -263,7 +263,7 @@ def ria_score(x):
  
 
 class Attention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config,i):
         super().__init__()
         self.n_heads = config.n_head
         self.n_embd = config.n_embd
@@ -286,8 +286,12 @@ class Attention(nn.Module):
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
-        self.rope = config.rope
-        limit = config.block_size // 2
+        self.max_scale = int(config.block_size//i)
+
+        self.rope = RoPE(config.n_embd // config.n_head,max_scale=self.max_scale, max_len=config.block_size)
+
+
+        limit =  self.max_scale//2
         #self.ria_param = nn.Parameter(torch.full((n_heads, 1, 1), 2 * math.pi))
         
         # in forward, clamp to [pi/2, 2pi]
@@ -462,9 +466,9 @@ def norm(x):
 
 
 class Block(nn.Module):
-    def __init__(self, config, block_idx):
+    def __init__(self, config, i):
         super().__init__()
-        self.attn = Attention(config)
+        self.attn = Attention(config,i)
         self.attn_dir = MLP_bottle(config)
         self.config = config
 
@@ -574,13 +578,10 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        self.rope = RoPE(config.n_embd // config.n_head, max_len=config.block_size)
-        self.config.rope = self.rope
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(self.config,i) for i in range(config.n_layer)]),
+            h = nn.ModuleList([Block(self.config,config.n_layer-i) for i in range(config.n_layer)]),
         ))
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
         self.register_buffer("mask", mask_tensor)
@@ -597,7 +598,7 @@ class GPT(nn.Module):
         #if pretrained with 1.0 and then lowered to 0.5 or 1.0(note this WILL)
         #break checkpoints, you can keep the coarse manifold principle direction,
         #and obtain fine-scale geometric flexibility. That's an option.
-        
+
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
