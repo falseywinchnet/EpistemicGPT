@@ -211,7 +211,7 @@ class MLP_bottle(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.GLU = LogisticGLU(config.n_embd,config.n_embd//2)
+        self.GLU = GLU(config.n_embd,config.n_embd//2)
 
 
     def forward(self, x):
@@ -230,8 +230,8 @@ def ria_score(x):
     not through the activation.
     """
     #if beta is None: #default to the gaussian fit
-    #beta = 1.0 / math.sqrt(2.0 * math.pi)
-    beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
+    beta = 1.0 / math.sqrt(2.0 * math.pi)
+    #beta = 1.0 / math.sqrt( math.pi) #if you want it to emulate softplus
    # else:
         #beta = (F.softplus(beta)) 
     z = beta * x
@@ -606,7 +606,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
 
         for i, block in enumerate(self.transformer.h):
-            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            x = block(x)
 
         if targets is not None:
             logits = self.lm_head(x)
