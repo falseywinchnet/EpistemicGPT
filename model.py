@@ -284,7 +284,7 @@ class Attention(nn.Module):
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
 
-        q = F.rms_norm(q, (D,)) #never ever norm k, you stupid fuck
+        q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
@@ -358,7 +358,7 @@ class Attention(nn.Module):
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
-        mix_dir = F.normalize(mix_variance, dim=-1)
+        mix_dir = F.normalize(mix_variance, dim=-1,eps=1e-6)
 
         # === Residual sink ===
         current_mass = attn.sum(dim=-1, keepdim=True)
@@ -366,7 +366,7 @@ class Attention(nn.Module):
         y_res = residual_weight * self.v_sink_residual
 
         # === XSA ===
-        vn = F.normalize(v, dim=-1)
+        vn = F.normalize(v, dim=-1,eps=1e-6)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
         y = F.rms_norm(y_context, (D,)) +self.v_sink_basis + y_res
@@ -399,7 +399,7 @@ class Attention(nn.Module):
 
 
 def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+    return F.rms_norm(x, (x.size(-1),),eps=1e-6)
 
 class Block(nn.Module):
     def __init__(self, config, block_idx):
@@ -470,7 +470,7 @@ class SoftplusCELoss(nn.Module):
 
         if self.label_smoothing > 0.0:
             # smooth term: average negative log-prob across vocab
-            smooth_loss = -torch.log(probs + 1e-8).mean(dim=-1)
+            smooth_loss = -torch.log(probs + 1e-6).mean(dim=-1)
             loss = (1.0 - self.label_smoothing) * loss + self.label_smoothing * smooth_loss
 
         return loss.mean()
@@ -497,7 +497,7 @@ class SubspaceUnembed(nn.Module):
         logits = 0
         residual = h
         for i in range(self.n_slices):
-            vn = F.normalize(self.dir_nets[i](h), dim=-1)
+            vn = F.normalize(self.dir_nets[i](h), dim=-1,eps=1e-6)
             component = (residual * vn).sum(dim=-1, keepdim=True) * vn
             residual = residual - component
             logits = logits + self.projs[i](component)
