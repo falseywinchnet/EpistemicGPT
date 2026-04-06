@@ -244,8 +244,8 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
-
-
+        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
+        self.beta= 1/self.scale
     def get_p_matrix(self):
         skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
         return torch.matrix_exp(skew)
@@ -294,7 +294,7 @@ class Attention(nn.Module):
 
         mask = self.mask[:, :, :T, :T]
 
-        soft_scores = F.softplus(scores)
+        soft_scores = self.beta  * F.softplus(self.scale* scores) #zero point mass is log(2)/alpha or ~0.382.
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
         threshold = 1e-6
@@ -437,6 +437,8 @@ class SoftplusCELoss(nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
+        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
+        self.beta = 1/self.scale
 
     def forward(self, logits, targets):
         # logits: (B, V) or (B, T, V)
@@ -452,7 +454,7 @@ class SoftplusCELoss(nn.Module):
             return flat_logits.sum() * 0.0
 
         # softplus "probabilities" -- same mechanism as your attention
-        sp = F.softplus(flat_logits)
+        sp = self.beta * F.softplus(self.scale * flat_logits)
 
         threshold = 1e-6
         pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
@@ -534,13 +536,15 @@ class GPT(nn.Module):
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def register_confined_backward(self, alpha=1.0):
-        hook = make_boundary_ste_hook(alpha)
+    def register_confined_backward(self, alpha=0.5):
+        hook = make_boundary_ste_hook(0.5)
         handles = []
-    
+        i = 1
+        L = len(self.transformer.h)
         for block in self.transformer.h:
-            handles.append(block.attn.register_full_backward_hook(hook))
-            handles.append(block.attn_dir.register_full_backward_hook(hook))
+            handles.append(block.attn.register_full_backward_hook(make_boundary_ste_hook(float(1-2**(-i/L))))) #gently diminish contributions
+            handles.append(block.attn_dir.register_full_backward_hook(hook)) #mlp contribution is tiny anyway
+            i = i  + 1
     
         self._boundary_handles = handles
         self._confined_alpha = alpha
