@@ -185,6 +185,30 @@ class MLP_bottle(nn.Module):
         return x
 
 
+class GLU(nn.Module):
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.linear = nn.Linear(d_in, d_in)
+        self.W_freq = nn.Linear(d_in, d_in)  # shared frequency map
+        self.W_out  = nn.Linear(d_in, d_out, bias=False)
+        self.W_cos = nn.Linear(d_in, d_in)  # shared frequency map
+        self.sin_scale = nn.Parameter(torch.tensor(0.1))
+        self.sin2_scale = nn.Parameter(torch.tensor(0.1))
+
+        nn.init.normal_(self.W_freq.weight, 0.0, 0.10 / math.sqrt(d_in))
+        nn.init.normal_(self.W_cos.weight,  0.0, 0.03 / math.sqrt(d_in))
+        nn.init.normal_(self.W_out.weight,  0.0, 0.70 / math.sqrt(d_in))
+        nn.init.normal_(self.linear.weight, 0.0, 1.00 / math.sqrt(d_in))
+
+    def forward(self, x):
+        z    = self.linear(norm(x))
+        gate = z * torch.sigmoid(z * (math.pi / math.sqrt(3)))
+        
+        freq = self.W_freq(norm(x))          # shared phase input
+        gate = gate +  self.sin_scale * torch.sin(freq)
+        return self.W_out(gate)+( torch.sin(gate)*self.sin2_scale)   # quadrature component C
+
+
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
