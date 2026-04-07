@@ -618,7 +618,7 @@ class GPT(nn.Module):
 
         self._boundary_handles = []
         self._linear_states = {}
-        self.register_confined_backward()
+        #self.register_confined_backward() experiment with at LATER TIME
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
