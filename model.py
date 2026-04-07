@@ -283,20 +283,15 @@ class GLU(nn.Module):
         self.linear = nn.Linear(d_in, d_in)
         self.W_freq = nn.Linear(d_in, d_in)  # shared frequency map
         self.W_out  = nn.Linear(d_in, d_out, bias=False)
-        self.W_cos = nn.Linear(d_in, d_in)  # shared frequency map
         self.sin_scale = nn.Parameter(torch.tensor(0.1))
         self.sin2_scale = nn.Parameter(torch.tensor(0.1))
 
-        nn.init.normal_(self.W_freq.weight, 0.0, 0.10 / math.sqrt(d_in))
-        nn.init.normal_(self.W_cos.weight,  0.0, 0.03 / math.sqrt(d_in))
-        nn.init.normal_(self.W_out.weight,  0.0, 0.70 / math.sqrt(d_in))
-        nn.init.normal_(self.linear.weight, 0.0, 1.00 / math.sqrt(d_in))
-
     def forward(self, x):
-        z    = self.linear(norm(x))
+        q = norm(x)
+        z    = self.linear(q)
         gate = z * torch.sigmoid(z * (math.pi / math.sqrt(3)))
         
-        freq = self.W_freq(norm(x))          # shared phase input
+        freq = self.W_freq(q)          # shared phase input
         gate = gate +  self.sin_scale * torch.sin(freq)
         return self.W_out(gate)+( torch.sin(gate)*self.sin2_scale)   # quadrature component C
 
@@ -622,7 +617,7 @@ class GPT(nn.Module):
           block.attn.mask = self.mask #set here
 
         self._boundary_handles = []
-        self.linear_states = {}
+        self._linear_states = {}
         self.register_confined_backward()
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
@@ -643,7 +638,7 @@ class GPT(nn.Module):
             handles.append(block.attn_dir.register_full_backward_hook(mlphook)) #mlp contribution is tiny anyway
             i = i  + 1
 
-        for name, m in model.named_modules():
+        for name, m in self.named_modules():
             if isinstance(m, nn.Linear):
                 hook, st = make_texture_hook()
                 h = m.register_full_backward_hook(hook)
@@ -652,19 +647,8 @@ class GPT(nn.Module):
 
     
         self._boundary_handles = handles
-        self.linear_states=states
+        self._linear_states=states
         
-
-    def reapply_confined_backward(self, alpha=0.5):
-        #this is checkpointing incompatible at the moment. needs pytorch changes. 
-        if hasattr(self, "_boundary_handles"):
-            for h in self._boundary_handles:
-                h.remove()
-        self._boundary_handles = []
-        
-        self.register_confined_backward(alpha=alpha)
-        
-
 
 
     def get_num_params(self, non_embedding=True):
