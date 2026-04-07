@@ -299,6 +299,7 @@ class GLU(nn.Module):
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.depth = 0
         self.n_heads = config.n_head
         self.n_embd = config.n_embd
         dim = config.n_embd
@@ -390,7 +391,7 @@ class Attention(nn.Module):
 
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
-        if self.training:
+        if self.training and self.depth >3: #only apply to later layers
             # Create Distance Matrix [T, T]
             # dist[i, j] = i - j
             # We only care about positive distances (j <= i), which causal mask handles
@@ -613,8 +614,11 @@ class GPT(nn.Module):
         ))
         mask_tensor = torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size).to(device=self.config.device)
         self.register_buffer("mask", mask_tensor)
+        i = 0
         for block in self.transformer.h:
           block.attn.mask = self.mask #set here
+          block.attn.depth= i
+          i = i + 1
 
         self._boundary_handles = []
         self._linear_states = {}
@@ -662,7 +666,7 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
 
         for i, block in enumerate(self.transformer.h):
-            x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            x = block(x)
 
         if targets is not None:
             logits = self.lm_head(x)
