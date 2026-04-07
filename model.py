@@ -37,6 +37,98 @@ def make_boundary_ste_hook(alpha=1.0):
         return (new_gi,) + tuple(grad_input[1:])
     return hook
 
+def make_texture_hook(ema_decay=0.95, roughness_decay=0.95, 
+                      smooth_floor=0.3, rough_focus=0.8, eps=1e-8):
+    """
+    External memory per linear layer, living in the closure.
+    
+    State:
+      direction: EMA of gradient (unnormalized accumulator, normalized on use)
+      variance:  EMA of squared deviation from direction (roughness)
+      grad_sq:   EMA of squared gradient norm (for normalizing variance)
+      scale:     the integrated scalar output
+    """
+    state = {
+        "direction": None,   # running mean gradient, same shape as grad
+        "variance": None,    # running mean squared deviation from direction
+        "grad_sq_ema": None, # running mean of ||g||^2 for relative roughness
+        "step": 0,
+    }
+    
+    def hook(module, grad_input, grad_output):
+        g = grad_input[0]
+        if g is None:
+            return None
+        
+        with torch.no_grad():
+            flat = g.reshape(g.shape[0], -1)  # (batch, features) or just (features,)
+            
+            # initialize state on first call
+            if state["direction"] is None:
+                state["direction"] = torch.zeros_like(flat)
+                state["variance"] = torch.zeros(flat.shape[0], device=flat.device)
+                state["grad_sq_ema"] = torch.zeros(flat.shape[0], device=flat.device)
+            
+            state["step"] += 1
+            a = ema_decay
+            ar = roughness_decay
+            
+            # bias correction weight
+            bc = 1.0 / (1.0 - a ** state["step"])
+            
+            # update direction EMA
+            state["direction"].mul_(a).add_(flat, alpha=1 - a)
+            dir_corrected = state["direction"] * bc
+            
+            # normalize direction to unit vector per sample
+            dir_norm = dir_corrected.norm(dim=-1, keepdim=True).clamp(min=eps)
+            d_hat = dir_corrected / dir_norm
+            
+            # deviation: how far is current gradient from principal direction?
+            proj_scalar = (flat * d_hat).sum(dim=-1, keepdim=True)
+            orthogonal = flat - proj_scalar * d_hat
+            dev_sq = (orthogonal ** 2).sum(dim=-1)
+            grad_sq = (flat ** 2).sum(dim=-1)
+            
+            # update roughness and magnitude EMAs
+            state["variance"].mul_(ar).add_(dev_sq, alpha=1 - ar)
+            state["grad_sq_ema"].mul_(ar).add_(grad_sq, alpha=1 - ar)
+            
+            # relative roughness: what fraction of gradient energy is off-direction?
+            # 0 = perfectly aligned with principal direction (smooth)
+            # 1 = entirely orthogonal (rough)
+            roughness = state["variance"] / state["grad_sq_ema"].clamp(min=eps)
+            roughness = roughness.clamp(0, 1)
+            
+            # --- scaling logic ---
+            # smoothness = 1 - roughness
+            # when smooth: scale down overall (don't overcorrect)
+            # when rough: focus on direction, amplify along it
+            
+            smoothness = 1.0 - roughness  # per-sample
+            
+            # overall magnitude scale: high when rough, drops to floor when smooth
+            magnitude = smooth_floor + (1.0 - smooth_floor) * roughness
+            magnitude = magnitude.unsqueeze(-1)
+            
+            # focus: how much to concentrate onto principal direction
+            # rough -> high focus, smooth -> low focus (let full gradient through at reduced scale)
+            focus = rough_focus * roughness.unsqueeze(-1)
+            
+            # decompose gradient
+            g_parallel = proj_scalar * d_hat
+            g_ortho = orthogonal
+            
+            # blend: ortho component gets attenuated by focus
+            g_new = magnitude * (g_parallel + (1.0 - focus) * g_ortho)
+        
+        # reshape back and return
+        out = list(grad_input)
+        out[0] = g_new.reshape(g.shape)
+        return tuple(out)
+    
+    return hook, state
+
 class LELU(nn.Module):
     def __init__(self):
         super().__init__()
@@ -530,25 +622,38 @@ class GPT(nn.Module):
           block.attn.mask = self.mask #set here
 
         self._boundary_handles = []
-        self.register_confined_backward(alpha=1.0)
+        self.linear_states = {}
+        self.register_confined_backward()
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
 
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
-    def register_confined_backward(self, alpha=0.5):
-        hook = make_boundary_ste_hook(0.5)
+
+  
+    def register_confined_backward(self):
+        states = {}
         handles = []
+        mlphook = make_boundary_ste_hook(0.5)
+
         i = 1
         L = len(self.transformer.h)
         for block in self.transformer.h:
             handles.append(block.attn.register_full_backward_hook(make_boundary_ste_hook(float(1-2**(-i/L))))) #gently diminish contributions
-            handles.append(block.attn_dir.register_full_backward_hook(hook)) #mlp contribution is tiny anyway
+            handles.append(block.attn_dir.register_full_backward_hook(mlphook)) #mlp contribution is tiny anyway
             i = i  + 1
+
+        for name, m in model.named_modules():
+            if isinstance(m, nn.Linear):
+                hook, st = make_texture_hook()
+                h = m.register_full_backward_hook(hook)
+                handles.append(h)
+                states[name] = st
+
     
         self._boundary_handles = handles
-        self._confined_alpha = alpha
-        return handles
+        self.linear_states=states
+        
 
     def reapply_confined_backward(self, alpha=0.5):
         #this is checkpointing incompatible at the moment. needs pytorch changes. 
