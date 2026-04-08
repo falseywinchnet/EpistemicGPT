@@ -321,7 +321,7 @@ class Attention(nn.Module):
         nn.init.eye_(self.q_proj.weight) # Identity Init
         self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
         self.v_sink_basis = nn.Parameter(torch.ones(1, self.n_heads, 1, self.head_dim))
-
+        self.sink_key = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
@@ -378,12 +378,14 @@ class Attention(nn.Module):
 
         q = self.rope(q)
         k = self.rope(k)
-
+        k_with_null = torch.cat([k, self.sink_key.expand(B, -1, -1, -1)], dim=2)
+        # Score q against extended keys
+        scores = (q @ k_with_null.transpose(-2, -1)) * (math.log(T+1) * math.log(D))
         # Soft Attention
-        scores = (q @ k.transpose(-2, -1)) * (math.log(T)* math.log(D)) # Bo Gao, Michael Spratling
 
         mask = self.mask[:, :, :T, :T]
-
+        null_col = torch.ones(1, 1, T, 1, device=x.device)
+        mask = torch.cat([mask, null_col], dim=-1)  # (1, 1, T, T+1)
         soft_scores = self.beta  * F.softplus(self.scale* scores) #zero point mass is log(2)/alpha or ~0.382.
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
@@ -439,8 +441,9 @@ class Attention(nn.Module):
         attn = torch.nan_to_num(attn, nan=0.0)
 
             # ===== Replace everything from y_context = attn @ v onward =====
-
-        y_context = attn @ v  # (B, H, T, D)
+        attn_real = attn[:, :, :, :T]   # drop the null column
+        attn_null = attn[:, :, :, T:]   # this is the absorbed mass, discard or log it
+        y_context = attn_real @ v
 
         # === Mixing tensor: variance of the attended distribution ===
         #v_sq = attn @ (v * v)  # E[v^2] under attention weights
@@ -448,7 +451,7 @@ class Attention(nn.Module):
 
         #todo : try instead
         #y_context = attn @ v
-        y_sharp = (attn * attn) @ v
+        y_sharp = (attn_real * attn_real) @ v
         mix_signal = y_sharp - y_context
         #this could arguably perform about as well, is more direct, and can be a cheaper metric
         #Kontorovich's bound suggests equal goodness of fit
@@ -458,15 +461,12 @@ class Attention(nn.Module):
         mix_dir = F.normalize(mix_signal, dim=-1,eps=1e-6)
 
         # === Residual sink ===
-        current_mass = attn.sum(dim=-1, keepdim=True)
-        residual_weight = 1.0 - F.sigmoid(current_mass)
-        y_res = residual_weight * self.v_sink_residual
 
         # === XSA ===
         vn = F.normalize(v, dim=-1,eps=1e-6)
         y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis + y_res
+        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis
         # y is (B, H, T, D)
 
         # === O/P decomposition along mixing tensor eigenvectors ===
