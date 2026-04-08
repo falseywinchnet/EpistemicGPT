@@ -442,6 +442,7 @@ class Attention(nn.Module):
         #y_sharp = (attn * attn) @ v
         #mix_signal = y_sharp - y_context
         #this could arguably perform about as well, is more direct, and can be a cheaper metric
+        #Kontorovich's bound suggests equal goodness of fit
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
