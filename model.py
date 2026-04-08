@@ -311,8 +311,12 @@ class Attention(nn.Module):
 
 
         self.q_proj = nn.Linear(dim,dim,bias=False)
+        self.k_proj = nn.Linear(dim,dim,bias=False)
+
         self.v_proj = nn.Linear(dim,dim,bias=False)
         self.o_proj = nn.Linear(dim,dim,bias=False)
+        self.p_proj = nn.Linear(dim,dim,bias=False)
+
         self.s_proj = nn.Linear(dim, dim, bias=False)
         self.p_mlp = MLP(config)
         self.o_mlp = MLP(config)
@@ -330,14 +334,12 @@ class Attention(nn.Module):
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
         self.register_buffer('k_alpha', alphas)
-        self.p_skew_basis = nn.Parameter(
-            torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
-        )
+   
         self.register_buffer('skew_u', F.normalize(torch.randn(self.n_heads, self.head_dim), dim=-1))
-        self.register_buffer('p_skew_u', F.normalize(torch.randn(self.n_heads, self.head_dim), dim=-1))
         self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
         self.beta= 1/self.scale
 
+        
     def cayley(self, skew_basis, u):
         A = skew_basis - skew_basis.transpose(-1, -2)  # (H, D, D)
         with torch.no_grad():
@@ -349,11 +351,11 @@ class Attention(nn.Module):
         I = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype).unsqueeze(0)
         return torch.linalg.solve(I + A, I - A)
 
+
+
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
-
-        # Get per-head rotations
         Rs = self.cayley(self.skew_basis,self.skew_u) # [H, D, D]
 
         # 1. Reshape q_proj weight to [H, D_h, Dim]
@@ -367,12 +369,9 @@ class Attention(nn.Module):
         # This effectively constructs a Block-Diagonal W_k
         W_k = W_k_heads.view(-1, self.n_embd)
 
-        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
-
-
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-
 
         q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
 
@@ -407,13 +406,13 @@ class Attention(nn.Module):
         y_context = attn_real @ v
 
         # === Mixing tensor: variance of the attended distribution ===
-        #v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        #mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        v_sq = attn_real @ (v * v)  # E[v^2] under attention weights
+        mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
         #todo : try instead
         #y_context = attn @ v
-        y_sharp = (attn_real * attn_real) @ v
-        mix_signal = y_sharp - y_context
+        #y_sharp = (attn_real * attn_real) @ v
+        #mix_signal = y_sharp - y_context
         #this could arguably perform about as well, is more direct, and can be a cheaper metric
         #Kontorovich's bound suggests equal goodness of fit
 
@@ -444,13 +443,9 @@ class Attention(nn.Module):
 
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
-        Rs_p = self.cayley(self.p_skew_basis,self.p_skew_u)  # (H, D, D)
-        W_o_heads = self.o_proj.weight.view(self.n_heads, self.head_dim, -1)
-        W_p_heads = Rs_p @ W_o_heads
-        W_p = W_p_heads.view(-1, self.n_embd)
 
         o__out = self.o_proj(y_along_flat)      # mixing-axis content through O
-        p__out = F.linear(y_ortho_flat, W_p)    # orthogonal content through P
+        p__out = self.p_proj(y_ortho_flat)    # orthogonal content through P
         s__out = self.s_proj(poynting)      # poynting vector
 
         return self.s_mlp(s__out) + self.p_mlp(p__out) + self.o_mlp(o__out)
