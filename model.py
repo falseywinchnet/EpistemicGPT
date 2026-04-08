@@ -252,10 +252,29 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.act = LELU()
+        self.c_fc  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+
         self.c_proj  = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
+        x = self.c_fc(x)
+        x = self.act(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+class MLP_wide(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.act = LELU()
+        self.c_fc  = nn.Linear(config.n_embd, config.n_embd*2, bias=config.bias)
+
+        self.c_proj  = nn.Linear(config.n_embd*2, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
         x = self.act(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -311,13 +330,7 @@ class Attention(nn.Module):
 
 
         self.q_proj = nn.Linear(dim,dim,bias=False)
-        self.k_proj = nn.Linear(dim,dim,bias=False)
-
-        self.v_proj = nn.Linear(dim,dim,bias=False)
-        self.o_proj = nn.Linear(dim,dim,bias=False)
-        self.p_proj = nn.Linear(dim,dim,bias=False)
-
-        self.s_proj = nn.Linear(dim, dim, bias=False)
+        self.v_proj = MLP_wide(config)#we need more space here.  MORE!
         self.p_mlp = MLP(config)
         self.o_mlp = MLP(config)
         self.s_mlp = MLP(config)
@@ -339,7 +352,8 @@ class Attention(nn.Module):
         self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
         self.beta= 1/self.scale
 
-        
+        self.x_dir = MLP_bottle(config)
+
     def cayley(self, skew_basis, u):
         A = skew_basis - skew_basis.transpose(-1, -2)  # (H, D, D)
         with torch.no_grad():
@@ -369,10 +383,11 @@ class Attention(nn.Module):
         # This effectively constructs a Block-Diagonal W_k
         W_k = W_k_heads.view(-1, self.n_embd)
 
+
         k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-
+        
         q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
@@ -440,15 +455,9 @@ class Attention(nn.Module):
         y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
         poynting = y_along_flat * y_ortho_flat
   
-
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
-
-        o__out = self.o_proj(y_along_flat)      # mixing-axis content through O
-        p__out = self.p_proj(y_ortho_flat)    # orthogonal content through P
-        s__out = self.s_proj(poynting)      # poynting vector
-
-        return self.s_mlp(s__out) + self.p_mlp(p__out) + self.o_mlp(o__out)
+        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
 
 
 def norm(x):
