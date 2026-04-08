@@ -296,6 +296,7 @@ class GLU(nn.Module):
         return self.W_out(gate)+( torch.sin(gate)*self.sin2_scale)   # quadrature component C
 
 
+
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -332,11 +333,19 @@ class Attention(nn.Module):
         self.p_skew_basis = nn.Parameter(
             torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
         )
+        self.register_buffer('skew_u', F.normalize(torch.randn(self.n_heads, self.head_dim), dim=-1))
+        self.register_buffer('p_skew_u', F.normalize(torch.randn(self.n_heads, self.head_dim), dim=-1))
         self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
         self.beta= 1/self.scale
 
-    def cayley(self,skew_basis):
-        A = skew_basis - skew_basis.transpose(-1, -2)
+    def cayley(self, skew_basis, u):
+        A = skew_basis - skew_basis.transpose(-1, -2)  # (H, D, D)
+        with torch.no_grad():
+            new_u = F.normalize(torch.einsum('hij,hj->hi', A, u), dim=-1)
+            sigma = (new_u * torch.einsum('hij,hj->hi', A, new_u)).sum(dim=-1)  # (H,)
+            scale = torch.clamp(sigma / 0.95, min=1.0)
+            u.copy_(new_u)
+        A = A / scale[:, None, None]
         I = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype).unsqueeze(0)
         return torch.linalg.solve(I + A, I - A)
 
@@ -345,7 +354,7 @@ class Attention(nn.Module):
         H, D = self.n_heads, self.head_dim
 
         # Get per-head rotations
-        Rs = self.cayley(self.skew_basis) # [H, D, D]
+        Rs = self.cayley(self.skew_basis,self.skew_u) # [H, D, D]
 
         # 1. Reshape q_proj weight to [H, D_h, Dim]
         W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
@@ -434,19 +443,19 @@ class Attention(nn.Module):
         y_context = attn @ v  # (B, H, T, D)
 
         # === Mixing tensor: variance of the attended distribution ===
-        v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        #v_sq = attn @ (v * v)  # E[v^2] under attention weights
+        #mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
         #todo : try instead
         #y_context = attn @ v
-        #y_sharp = (attn * attn) @ v
-        #mix_signal = y_sharp - y_context
+        y_sharp = (attn * attn) @ v
+        mix_signal = y_sharp - y_context
         #this could arguably perform about as well, is more direct, and can be a cheaper metric
         #Kontorovich's bound suggests equal goodness of fit
 
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
-        mix_dir = F.normalize(mix_variance, dim=-1,eps=1e-6)
+        mix_dir = F.normalize(mix_signal, dim=-1,eps=1e-6)
 
         # === Residual sink ===
         current_mass = attn.sum(dim=-1, keepdim=True)
@@ -474,7 +483,7 @@ class Attention(nn.Module):
 
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
-        Rs_p = self.cayley(self.p_skew_basis)  # (H, D, D)
+        Rs_p = self.cayley(self.p_skew_basis,self.p_skew_u)  # (H, D, D)
         W_o_heads = self.o_proj.weight.view(self.n_heads, self.head_dim, -1)
         W_p_heads = Rs_p @ W_o_heads
         W_p = W_p_heads.view(-1, self.n_embd)
