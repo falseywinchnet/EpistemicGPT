@@ -334,25 +334,18 @@ class Attention(nn.Module):
         )
         self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
         self.beta= 1/self.scale
-    def get_p_matrix(self):
-        skew = self.p_skew_basis - self.p_skew_basis.transpose(-1, -2)
-        return torch.matrix_exp(skew)
 
-    def get_orthogonal_matrix(self):
-        # A = M - M.T (Skew symmetric)
-        # We broadcast the transpose over the last two dims
-        skew = self.skew_basis - self.skew_basis.transpose(-1, -2)
-
-        # Matrix Exp for each head independently
-        # Result: [H, D_h, D_h]
-        return torch.matrix_exp(skew)
+    def cayley(self,skew_basis):
+        A = skew_basis - skew_basis.transpose(-1, -2)
+        I = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype).unsqueeze(0)
+        return torch.linalg.solve(I + A, I - A)
 
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
         # Get per-head rotations
-        Rs = self.get_orthogonal_matrix() # [H, D, D]
+        Rs = self.cayley(self.skew_basis) # [H, D, D]
 
         # 1. Reshape q_proj weight to [H, D_h, Dim]
         W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
@@ -474,7 +467,7 @@ class Attention(nn.Module):
 
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
-        Rs_p = self.get_p_matrix()  # (H, D, D)
+        Rs_p = self.cayley(self.p_skew_basis)  # (H, D, D)
         W_o_heads = self.o_proj.weight.view(self.n_heads, self.head_dim, -1)
         W_p_heads = Rs_p @ W_o_heads
         W_p = W_p_heads.view(-1, self.n_embd)
