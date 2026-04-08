@@ -392,48 +392,9 @@ class Attention(nn.Module):
         threshold = 1e-6
         pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
         soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
-
         soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
 
-        if self.training and self.depth >3: #only apply to later layers
-            # Create Distance Matrix [T, T]
-            # dist[i, j] = i - j
-            # We only care about positive distances (j <= i), which causal mask handles
-            indices = torch.arange(T, device=x.device)
-            dist = indices.view(-1, 1) - indices.view(1, -1)
-
-            # Gaussian Decay Profile
-            # P(drop) is high when dist is small (Recent)
-            # P(drop) is low when dist is large (Distant)
-            # We clamp dist to 0 to avoid NaNs, though masking handles it
-
-
-            # Broadcast probabilities to batch/heads [1, 1, T, T]
-            dist = dist.float().clamp(min=0)
-            drop_probs = self.sd_alpha * torch.exp(-(dist**2) / (2 * self.sd_sigma**2))
-
-            # Align dimensions: [1, 1, T, T]
-            drop_probs = drop_probs.unsqueeze(0).unsqueeze(0)
-
-            #dont allow damage to the first half, regardless
-            #limited suppot positions do not get eroded
-            limit = T // 2
-            absolute_cutoff_mask = (dist > limit)
-            drop_probs = drop_probs.masked_fill(absolute_cutoff_mask, 0.0)
-            #Expand BEFORE sampling to ensure atomic independence
-            # We must explicitly expand to [B, H, T, T] so Bernoulli rolls
-            # a unique die for every single head and batch item.
-            drop_probs_expanded = drop_probs.expand(B, H, T, T)
-
-            # Generate Bernoulli Mask on the full tensor
-            keep_mask = torch.bernoulli(1.0 - drop_probs_expanded).bool()
-
-            # Apply Dropout
-            soft_scores = soft_scores.masked_fill(~keep_mask, 0.0)
-            #what this does is force attention to learn deeper patterns.
-            #it also dramatically improves needles- it finds needles with same num batches,
-            #despite randomly hiding needles. so it technically sees needle far sooner.
-
+       
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
