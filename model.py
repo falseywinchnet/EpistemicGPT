@@ -437,6 +437,12 @@ class Attention(nn.Module):
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
         mix_variance = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
 
+        #todo : try instead
+        #y_context = attn @ v
+        #y_sharp = (attn * attn) @ v
+        #mix_signal = y_sharp - y_context
+        #this could arguably perform about as well, is more direct, and can be a cheaper metric
+
         # Project mix_variance into mixing directions
         # mix_proj learns to read the variance profile and output the principal mixing axis
         mix_dir = F.normalize(mix_variance, dim=-1,eps=1e-6)
