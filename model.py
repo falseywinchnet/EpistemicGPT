@@ -355,12 +355,13 @@ class Attention(nn.Module):
         self.x_dir = MLP_bottle(config)
 
     def cayley(self, skew_basis, u):
-        A = skew_basis - skew_basis.transpose(-1, -2)  # (H, D, D)
+        A = skew_basis - skew_basis.transpose(-1, -2)
         with torch.no_grad():
             new_u = F.normalize(torch.einsum('hij,hj->hi', A, u), dim=-1)
-            sigma = (new_u * torch.einsum('hij,hj->hi', A, new_u)).sum(dim=-1)  # (H,)
+            sigma = (new_u * torch.einsum('hij,hj->hi', A, new_u)).sum(dim=-1)
             scale = torch.clamp(sigma / 0.95, min=1.0)
-            u.copy_(new_u)
+            if self.training:
+                u.copy_(new_u)
         A = A / scale[:, None, None]
         I = torch.eye(A.shape[-1], device=A.device, dtype=A.dtype).unsqueeze(0)
         return torch.linalg.solve(I + A, I - A)
@@ -454,51 +455,10 @@ class Attention(nn.Module):
         y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
         y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
         poynting = y_along_flat * y_ortho_flat
-
-        if self.training: #save some pizza for later
-            self._cached_attn_real = attn_real.detach()
-            self._cached_v = v.detach()
-            self._cached_mix_dir = mix_dir.detach()
-            self._cached_vn = vn.detach()
-  
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
         return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
     
-    def forward_cached(self, drop_prob_fn=None):
-        attn_real = self._cached_attn_real
-        v = self._cached_v
-        mix_dir = self._cached_mix_dir
-        vn = self._cached_vn
-        B, H, T, D = v.shape
-
-        # apply perturbation to attention weights
-        if drop_prob_fn is not None:
-            keep_mask = drop_prob_fn(B, H, T, attn_real.device)
-            attn_real = attn_real * keep_mask
-            # renormalize
-            sums = attn_real.sum(dim=-1, keepdim=True).clamp(min=1e-6)
-            scale = torch.clamp(1.0 / sums, max=1.0)
-            attn_real = attn_real * scale
-
-        y_context = attn_real @ v
-        # rest of the decomposition, identical to forward
-        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
-        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis
-
-        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir
-        y_ortho = y - y_along
-        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
-        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
-        poynting = y_along_flat * y_ortho_flat
-
-        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
-
-    def clear_cache(self):
-        self._cached_attn_real = None
-        self._cached_v = None
-        self._cached_mix_dir = None
-        self._cached_vn = None
 
 
 def norm(x):
@@ -518,20 +478,8 @@ class Block(nn.Module):
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
-        if self.training:
-            self._cached_vn = vn.detach()
-            self._cached_q = q.detach()
-        return x
 
-    def forward_cached(self, x, drop_prob_fn=None):
-        z = self.attn.forward_cached(drop_prob_fn)
-        x = self._cached_q + z
         return x
-
-    def clear_cache(self):
-        self._cached_vn = None
-        self._cached_q = None
-        self.attn.clear_cache()
 
 
 
@@ -703,29 +651,20 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wte.weight.numel()
         return n_params
-
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
 
         for i, block in enumerate(self.transformer.h):
             x = block(x)
+
         if targets is not None:
             logits = self.lm_head(x)
             loss = self.criterion(logits, targets)
-
-        if self.training:
-            # perturbation pass
-            x_p = self.transformer.wte(idx).detach()
-            for block in self.transformer.h:
-                x_p = block.forward_cached(x_p, drop_prob_fn=self._drop_prob_fn)
-            logits_p = self.lm_head(x_p)
-            loss_p = self.criterion(logits_p, targets)
-            loss = loss + 0.1 * loss_p
-
-
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
+
+
