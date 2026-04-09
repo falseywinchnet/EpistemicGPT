@@ -721,10 +721,8 @@ class GPT(nn.Module):
                 x_p = block.forward_cached(x_p, drop_prob_fn=self._drop_prob_fn)
             logits_p = self.lm_head(x_p)
             loss_p = self.criterion(logits_p, targets)
-            loss = loss + self.robustness_weight * loss_p
+            loss = loss + 0.1 * loss_p
 
-            for block in self.transformer.h:
-                block.clear_cache()
 
         else:
             logits = self.lm_head(x[:, [-1], :])
