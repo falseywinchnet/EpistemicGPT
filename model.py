@@ -454,10 +454,51 @@ class Attention(nn.Module):
         y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
         y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
         poynting = y_along_flat * y_ortho_flat
+
+        if self.training: #save some pizza for later
+            self._cached_attn_real = attn_real.detach()
+            self._cached_v = v.detach()
+            self._cached_mix_dir = mix_dir.detach()
+            self._cached_vn = vn.detach()
   
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
         return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
+    
+    def forward_cached(self, drop_prob_fn=None):
+        attn_real = self._cached_attn_real
+        v = self._cached_v
+        mix_dir = self._cached_mix_dir
+        vn = self._cached_vn
+        B, H, T, D = v.shape
+
+        # apply perturbation to attention weights
+        if drop_prob_fn is not None:
+            keep_mask = drop_prob_fn(B, H, T, attn_real.device)
+            attn_real = attn_real * keep_mask
+            # renormalize
+            sums = attn_real.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            scale = torch.clamp(1.0 / sums, max=1.0)
+            attn_real = attn_real * scale
+
+        y_context = attn_real @ v
+        # rest of the decomposition, identical to forward
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis
+
+        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir
+        y_ortho = y - y_along
+        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
+        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
+        poynting = y_along_flat * y_ortho_flat
+
+        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
+
+    def clear_cache(self):
+        self._cached_attn_real = None
+        self._cached_v = None
+        self._cached_mix_dir = None
+        self._cached_vn = None
 
 
 def norm(x):
@@ -471,14 +512,28 @@ class Block(nn.Module):
         self.config = config
 
     def forward(self, x):
-
         a = norm(x)
         z = self.attn(a)
         vn = F.normalize(self.attn_dir(a), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
+        if self.training:
+            self._cached_vn = vn.detach()
+            self._cached_q = q.detach()
         return x
+
+    def forward_cached(self, x, drop_prob_fn=None):
+        z = self.attn.forward_cached(drop_prob_fn)
+        x = self._cached_q + z
+        return x
+
+    def clear_cache(self):
+        self._cached_vn = None
+        self._cached_q = None
+        self.attn.clear_cache()
+
+
 
 @dataclass
 class GPTConfig:
@@ -571,7 +626,21 @@ class SubspaceUnembed(nn.Module):
 
         return logits
 
-
+def make_gaussian_drop_fn(alpha=0.3, sigma_frac=0.5, protect_frac=0.5):
+    def drop_prob_fn(B, H, T, device):
+        indices = torch.arange(T, device=device)
+        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
+        
+        sigma = T * sigma_frac
+        drop_probs = alpha * torch.exp(-(dist ** 2) / (2 * sigma ** 2))
+        
+        limit = int(T * protect_frac)
+        drop_probs = drop_probs.masked_fill(dist > limit, 0.0)
+        
+        keep_mask = torch.bernoulli(1.0 - drop_probs.unsqueeze(0).unsqueeze(0).expand(B, H, T, T))
+        return keep_mask
+    
+    return drop_prob_fn
 
 class GPT(nn.Module):
     def __init__(self, config):
@@ -599,7 +668,7 @@ class GPT(nn.Module):
         #self.register_confined_backward() experiment with at LATER TIME
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
-
+        self._drop_prob_fn = make_gaussian_drop_fn(alpha=0.3, sigma_frac=0.5, protect_frac=0.5)
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
 
@@ -641,10 +710,22 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = block(x)
-
         if targets is not None:
             logits = self.lm_head(x)
             loss = self.criterion(logits, targets)
+
+        if self.training:
+            # perturbation pass
+            x_p = self.transformer.wte(idx).detach()
+            for block in self.transformer.h:
+                x_p = block.forward_cached(x_p, drop_prob_fn=self._drop_prob_fn)
+            logits_p = self.lm_head(x_p)
+            loss_p = self.criterion(logits_p, targets)
+            loss = loss + self.robustness_weight * loss_p
+
+            for block in self.transformer.h:
+                block.clear_cache()
+
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
