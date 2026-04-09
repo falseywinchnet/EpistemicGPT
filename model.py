@@ -455,10 +455,138 @@ class Attention(nn.Module):
         y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
         y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
         poynting = y_along_flat * y_ortho_flat
+
+        # O projects the component along the mixing direction
+        # P (orthogonal rotation of O) projects the orthogonal complement
+        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
+
+
+    def forward_training(self, x):
+        B, T, C = x.shape
+        H, D = self.n_heads, self.head_dim
+        Rs = self.cayley(self.skew_basis,self.skew_u) # [H, D, D]
+
+        # 1. Reshape q_proj weight to [H, D_h, Dim]
+        W_q = self.q_proj.weight.view(self.n_heads, self.head_dim, -1)
+
+        # 2. Rotate each head's slice of the weight matrix
+        # [H, D, D] @ [H, D, Dim] -> [H, D, Dim]
+        W_k_heads = Rs @ W_q
+
+        # 3. Flatten back to [Dim, Dim] for the linear layer
+        # This effectively constructs a Block-Diagonal W_k
+        W_k = W_k_heads.view(-1, self.n_embd)
+
+
+        k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        
+        q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
+
+        q = self.rope(q)
+        k = self.rope(k)
+        k_with_null = torch.cat([k, self.sink_key.expand(B, -1, -1, -1)], dim=2)
+        # Score q against extended keys
+        scores = (q @ k_with_null.transpose(-2, -1)) * (math.log(T+1) * math.log(D))
+        # Soft Attention
+
+        mask = self.mask[:, :, :T, :T]
+        null_col = torch.ones(1, 1, T, 1, device=x.device)
+        mask = torch.cat([mask, null_col], dim=-1)  # (1, 1, T, T+1)
+        soft_scores = self.beta  * F.softplus(self.scale* scores) #zero point mass is log(2)/alpha or ~0.382.
+        # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
+        # Values < 1e-6 do not participate in mass/scaling but receive gradients
+        threshold = 1e-6
+        pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
+        soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
+        soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
+
+       
+
+        soft_sums = soft_scores.sum(dim=-1, keepdim=True)
+        scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
+        attn = soft_scores * scale
+        attn = torch.nan_to_num(attn, nan=0.0)
+
+            # ===== Replace everything from y_context = attn @ v onward =====
+        attn_real = attn[:, :, :, :T]   # drop the null column
+        attn_null = attn[:, :, :, T:]   # this is the absorbed mass, discard or log it
+        y_context = attn_real @ v
+
+        # === Mixing tensor: variance of the attended distribution ===
+        v_sq = attn_real @ (v * v)  # E[v^2] under attention weights
+        mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+
+        #todo : try instead
+        #y_context = attn @ v
+        #y_sharp = (attn_real * attn_real) @ v
+        #mix_signal = y_sharp - y_context
+        #this could arguably perform about as well, is more direct, and can be a cheaper metric
+        #Kontorovich's bound suggests equal goodness of fit
+
+        # Project mix_variance into mixing directions
+        # mix_proj learns to read the variance profile and output the principal mixing axis
+        mix_dir = F.normalize(mix_signal, dim=-1,eps=1e-6)
+
+        # === Residual sink ===
+
+        # === XSA ===
+        vn = F.normalize(v, dim=-1,eps=1e-6)
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+
+        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis
+        # y is (B, H, T, D)
+
+        # === O/P decomposition along mixing tensor eigenvectors ===
+        # Decompose y into component along mix_dir and component orthogonal to it
+        # mix_dir is the dominant eigenvector of the mixing stress
+        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir  # projection onto mixing axis
+        y_ortho = y - y_along  # complement
+
+        # Flatten both to (B, T, C) for projection
+        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
+        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
+        poynting = y_along_flat * y_ortho_flat
+
+        self._cached_attn_real = attn_real.detach()
+        self._cached_v = v.detach()
+        self._cached_mix_dir = mix_dir.detach()
+        self._cached_vn = vn.detach()
+  
         # O projects the component along the mixing direction
         # P (orthogonal rotation of O) projects the orthogonal complement
         return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
     
+    def forward_cached(self, drop_prob_fn=None):
+        attn_real = self._cached_attn_real
+        v = self._cached_v
+        mix_dir = self._cached_mix_dir
+        vn = self._cached_vn
+        B, H, T, D = v.shape
+
+        # apply perturbation to attention weights
+        if drop_prob_fn is not None:
+            keep_mask = drop_prob_fn(B, H, T, attn_real.device)
+            attn_real = attn_real * keep_mask
+            # renormalize
+            sums = attn_real.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            scale = torch.clamp(1.0 / sums, max=1.0)
+            attn_real = attn_real * scale
+
+        y_context = attn_real @ v
+        # rest of the decomposition, identical to forward
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis
+
+        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir
+        y_ortho = y - y_along
+        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
+        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
+        poynting = y_along_flat * y_ortho_flat
+
+        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
+
 
 
 def norm(x):
@@ -478,8 +606,30 @@ class Block(nn.Module):
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
-
         return x
+
+    
+    def forward_training(self, x):
+        a = norm(x)
+        z = self.attn.forward_training(a)
+        vn = F.normalize(self.attn_dir(a), dim=-1)
+        q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
+        x = q + z
+
+    
+        self._cached_vn = vn.detach()
+        self._cached_q = q.detach()
+        return x
+
+    def forward_cached(self, x, drop_prob_fn=None):
+        z = self.attn.forward_cached(drop_prob_fn)
+        x = self._cached_q + z
+        return x
+
+    def clear_cache(self):
+        self._cached_vn = None
+        self._cached_q = None
+        self.attn.clear_cache()
 
 
 
@@ -667,4 +817,53 @@ class GPT(nn.Module):
 
         return logits, loss
 
+    def forward_training(self, idx, targets=None):
+        b, T = idx.size()
+        x = self.transformer.wte(idx)
 
+        for i, block in enumerate(self.transformer.h):
+            x = block.forward_training(x)
+
+        if targets is not None:
+            logits = self.lm_head(x)
+            loss = self.criterion(logits, targets)
+        else:
+            logits = self.lm_head(x[:, [-1], :])
+            loss = None
+
+        return logits, loss
+
+    def forward_perturbed(self, idx, targets):
+        x_p = self.transformer.wte(idx).detach()
+        for block in self.transformer.h:
+            x_p = block.forward_cached(x_p, drop_prob_fn=self._drop_prob_fn)
+        logits_p = self.lm_head(x_p)
+        return self.criterion(logits_p, targets)
+
+        
+optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+losses = []
+def train_epoch():
+    model.train()
+    itera = 0
+    total_loss = 0
+    for xb, yb in train_loader:
+          xb, yb = xb[0], yb[0]  # unwrap batch dimension
+          optimizer.zero_grad()
+          logits, loss_true = model(xb, yb)
+          #loss_p = model.forward_perturbed(xb, yb)
+          loss = loss_true #+ loss_p
+          loss.backward()
+          torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+          optimizer.step()
+          total_loss += loss_true.item()
+          losses.append(loss_true.item())
+          print(itera, loss_true.item())#,loss_p.item())
+          itera = itera + 1
+    return total_loss / len(train_loader)
+
+# === Run Training ===
+num_epochs = 10
+for epoch in range(1, num_epochs + 1):
+    train_loss = train_epoch()
+    print(f"Epoch {epoch:2d} | Train loss: {train_loss:.4f}")
