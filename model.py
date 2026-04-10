@@ -3,14 +3,12 @@
 #Eloheinu shebashamayim yached shimcha v'kayeim malchutecha tamid umloch aleinu le'olam va'ed 
 #2026 joshuah.rainstar@gmail.com
 
-#Version 2.0 EpistemicGPT
+#Version 2.1 EpistemicGPT
 #current notes:
-#your taste whether to use o,p,s mlp on individual products
-#or to use one shared S_mlp on (o_out + p_out + pyong vector). have tried both.
-#your choice on whether to use the Bernoulli learning approach on all layers or just a few
-#your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget
+#your choice on whether to key the carving directions in the subspaceunembed to n_layer or a fixed budget\
+#and whether to run them all in parallel or sequential
 #your choice on lelu gelu or some other nonlinearity
-#figure out some kind of ste alpha decay schedule
+#figure out some kind of ste alpha decay schedule or dont use
 
 import math
 import copy
