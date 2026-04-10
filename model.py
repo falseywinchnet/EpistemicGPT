@@ -332,9 +332,8 @@ class Attention(nn.Module):
         self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
         self.beta= 1/self.scale
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
-        self.posture_angle = nn.Linear(2, 1, bias=True)
-        nn.init.zeros_(self.posture_angle.weight)
-        nn.init.zeros_(self.posture_angle.bias)
+        self.s_gate = nn.Linear(2, 1, bias=True)
+        self.t_mlp = MLP(config)
         
     def forward(self, x):
         B, T, C = x.shape
@@ -392,12 +391,12 @@ class Attention(nn.Module):
         attn = torch.nan_to_num(attn, nan=0.0)
 
         y_context = attn @ v
-
+        v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
+        delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
+        #delta = y_context - v OR: 
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
         mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
-
-        mix_dir = F.normalize(mix_signal, dim=-1,eps=1e-6)
 
         # ===  sinking ===
         pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
@@ -413,39 +412,37 @@ class Attention(nn.Module):
         # second moment: how spread is it? (B, H, T, 1)
         var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
 
-        # === XSA ===
-        vn = F.normalize(v, dim=-1,eps=1e-6)
-        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
-        y = F.rms_norm(y_context, (D,)) +self.v_sink_basis +y_res
+        #XSA-like but purely self-term
+        self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
+        self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
+        
+        y_clean = y_context - self_weight * v
+        y_true = F.rms_norm(y_clean, (D,)) +self.v_sink_basis 
         # y is (B, H, T, D)
+        y_next = y_res + delta
 
-        # === O/P decomposition along mixing tensor eigenvectors ===
-        # Decompose y into component along mix_dir and component orthogonal to it
-        # mix_dir is the dominant eigenvector of the mixing stress
-        y_along = (y * mix_dir).sum(dim=-1, keepdim=True) * mix_dir  # projection onto mixing axis
-        y_ortho = y - y_along  # complement
+        # Position / Objective / Support / Transport
 
+        P_chan = y_true
+        O_chan = y_next
 
-        
-        # in forward, after computing mu, var, y_along, y_ortho:
-        # (B, H, T, 2) -> (B, H, T, 1)
-        theta = self.posture_angle(torch.cat([mu, var], dim=-1))
-        
-        cos_t = torch.cos(theta)
-        sin_t = torch.sin(theta)
-        
-        # rotate in the o/p plane
-        y_along_rot = cos_t * y_along + sin_t * y_ortho
-        y_ortho_rot = -sin_t * y_along + cos_t * y_ortho
+        s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
+        S_chan = mix_signal * y_true * s_conf
 
-        # Flatten both to (B, T, C) for projection
-        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
-        y_ortho_flat = y_ortho.transpose(1, 2).contiguous().view(B, T, -1)
-        poynting = y_along_flat * y_ortho_flat
-  
-        # O projects the component along the mixing direction
-        # P (orthogonal rotation of O) projects the orthogonal complement
-        return self.s_mlp(poynting) + self.p_mlp(y_ortho_flat) + self.o_mlp(y_along_flat)
+        T_chan = y_true * y_next #Poynting vector
+
+        P_flat = P_chan.transpose(1, 2).contiguous().view(B, T, -1)
+        O_flat = O_chan.transpose(1, 2).contiguous().view(B, T, -1)
+        S_flat = S_chan.transpose(1, 2).contiguous().view(B, T, -1)
+        T_flat = T_chan.transpose(1, 2).contiguous().view(B, T, -1)
+
+        return (
+            self.p_mlp(P_flat)
+            + self.o_mlp(O_flat)
+            + self.s_mlp(S_flat)
+            + self.t_mlp(T_flat)
+        )
+
 
 
 
