@@ -358,16 +358,12 @@ class Attention(nn.Module):
 
 
         self.q_proj = nn.Linear(dim,dim,bias=False)
-        nn.init.eye_(self.q_proj.weight) # Identity Init
-
-        self.v_proj = MLP_wide(config)#we need more space here.  MORE!
-        self.p_mlp = MLP(config)
+        self.k_proj = nn.Linear(dim,dim,bias=False)
+        self.v_proj = nn.Linear(dim,dim,bias=False)
         self.o_mlp = MLP(config)
         self.s_mlp = MLP(config)
-        self.t_mlp = MLP(config)
 
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-        self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
@@ -377,7 +373,6 @@ class Attention(nn.Module):
         self.sd_sigma = config.block_size / 2.0
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
         self.register_buffer('k_alpha', alphas)
-        self.sink_value = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
         self.s_gate = nn.Linear(2, 1, bias=True)
         
@@ -385,27 +380,8 @@ class Attention(nn.Module):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
-        # 1. Reshape q_proj weight to [H, D_h, Dim]
-        # 1. Normalize h to ensure it is a unit vector
-        # [H, D, 1]
-        h_norm = F.normalize(self.h, dim=1)
-        
-        # 2. Define the Householder operator: (I - 2vv^T)
-        # Instead of materializing (D, D), we apply it as a linear operator
-        # W_q shape: [H, D, Dim]
-        W_q = self.q_proj.weight.view(H, D, -1)
-        
-        # 3. Efficient reflection: W_k = W_q - 2 * v @ (v^T @ W_q)
-        # v^T @ W_q -> [H, 1, Dim]
-        vT_Wq = torch.matmul(h_norm.transpose(-1, -2), W_q)
-        # 2 * v @ (...) -> [H, D, Dim]
-        W_k_heads = W_q - 2 * torch.matmul(h_norm, vT_Wq)
-        
-        # 4. Flatten and project
-        W_k = W_k_heads.reshape(-1, self.n_embd)
-
-
-        k = F.linear(x, W_k).view(B, T, H, D).transpose(1, 2)
+      
+        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
         
@@ -427,10 +403,6 @@ class Attention(nn.Module):
        
 
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
-
-        residual = 1.0 - F.sigmoid(soft_sums)
-        y_res = residual * self.v_sink_residual
-        #tell the next layer- are we attending strongly? or weakly? 
 
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
         attn = soft_scores * scale
@@ -460,30 +432,26 @@ class Attention(nn.Module):
         #XSA-like but purely self-term
         self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
         self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
-        
+
+
+        s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
+
         y_clean = y_context - self_weight * v
-        y_true = F.rms_norm(y_clean, (D,)) +self.v_sink_basis 
+        y_clean = y_clean * mix_signal
+        y_true = F.rms_norm(y_clean, (D,))
         # y is (B, H, T, D)
-        y_next = y_res + delta
+        y_next = delta + self.v_sink_basis * s_conf
+        y_next =  F.rms_norm(y_next, (D,))
 
         # Position / Objective / Support / Transport
         #P is implied - it lives in the residual
 
-        O_chan = y_next
-
-        s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
-        S_chan = mix_signal * s_conf * y_true
-
-        T_chan = y_true * y_next #Poynting vector
-
-        O_flat = O_chan.transpose(1, 2).contiguous().view(B, T, -1)
-        S_flat = S_chan.transpose(1, 2).contiguous().view(B, T, -1)
-        T_flat = T_chan.transpose(1, 2).contiguous().view(B, T, -1)
+        O_flat = y_next.transpose(1, 2).contiguous().view(B, T, -1)
+        S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
 
         return (
               self.o_mlp(O_flat)
             + self.s_mlp(S_flat)
-            + self.t_mlp(T_flat)
         )
 
 
@@ -682,7 +650,7 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = block(x)
-
+        x = norm(x)
         if targets is not None:
             logits = self.lm_head(x)
             loss = self.criterion(logits, targets)
