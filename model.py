@@ -10,6 +10,44 @@
 #your choice on lelu gelu or some other nonlinearity
 #figure out some kind of ste alpha decay schedule or dont use
 
+
+'''
+Train all MLPS of form(linear,LELU,linear) with the following LR
+width LR
+4 2.0667168855e-01
+8 1.0333584427e-01
+16 5.1667922137e-02
+32 2.5833961069e-02
+64 1.2916980534e-02
+128 6.4584902671e-03
+192 4.3056601781e-03
+256 3.2292451336e-03
+384 2.1528300890e-03
+512 1.6146225668e-03
+1024 8.0731128339e-04
+2048 4.0365564170e-04
+4096 2.0182782085e-04
+8192 1.0091391042e-04
+16384 5.0456955212e-05
+Generalization error bounds for two-layer
+neural networks with Lipschitz loss function
+Jiang Yu Nguwi∗ Nicolas Privault
+ 1) activation/module-scale Lipschitz factor for the RMSNorm-guarded MLP
+       L_eff ~= 1.0998393201 * sqrt(dim)
+
+    2) expected top Hessian eigenvalue for the simplified linear+squared-loss model
+       with Gaussian batch inputs centered coordinatewise at 1.09984:
+       lambda_max = sigma^2 + dim * (1.09984)^2
+
+    3) hypothetical gradient-descent learning-rate edge and a conservative mean
+       lr_edge = 2 / lambda_max
+       lr = lr_edge / 2
+
+further estimations, calculations suggest that the LR on attention should be the MLP but divided by the highest width of the internal representation.
+in an OST model, its lr/3.
+
+
+'''
 import math
 import copy
 from dataclasses import dataclass
