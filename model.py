@@ -311,15 +311,17 @@ class Attention(nn.Module):
 
 
         self.q_proj = nn.Linear(dim,dim,bias=False)
+        nn.init.eye_(self.q_proj.weight) # Identity Init
+
         self.v_proj = MLP_wide(config)#we need more space here.  MORE!
         self.p_mlp = MLP(config)
         self.o_mlp = MLP(config)
         self.s_mlp = MLP(config)
+        self.t_mlp = MLP(config)
+
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.v_sink_residual = nn.Parameter(torch.zeros(1, 1, 1, self.head_dim))
 
-        nn.init.eye_(self.q_proj.weight) # Identity Init
-        self.v_sink_residual = nn.Parameter(torch.ones(1, 1, 1, self.head_dim))
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
@@ -333,7 +335,6 @@ class Attention(nn.Module):
         self.beta= 1/self.scale
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
         self.s_gate = nn.Linear(2, 1, bias=True)
-        self.t_mlp = MLP(config)
         
     def forward(self, x):
         B, T, C = x.shape
@@ -397,7 +398,6 @@ class Attention(nn.Module):
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
         mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
-
         # ===  sinking ===
         pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
         query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
@@ -422,23 +422,21 @@ class Attention(nn.Module):
         y_next = y_res + delta
 
         # Position / Objective / Support / Transport
+        #P is implied - it lives in the residual
 
-        P_chan = y_true
         O_chan = y_next
 
         s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
-        S_chan = mix_signal * y_true * s_conf
+        S_chan = mix_signal * s_conf * y_true
 
         T_chan = y_true * y_next #Poynting vector
 
-        P_flat = P_chan.transpose(1, 2).contiguous().view(B, T, -1)
         O_flat = O_chan.transpose(1, 2).contiguous().view(B, T, -1)
         S_flat = S_chan.transpose(1, 2).contiguous().view(B, T, -1)
         T_flat = T_chan.transpose(1, 2).contiguous().view(B, T, -1)
 
         return (
-            self.p_mlp(P_flat)
-            + self.o_mlp(O_flat)
+              self.o_mlp(O_flat)
             + self.s_mlp(S_flat)
             + self.t_mlp(T_flat)
         )
