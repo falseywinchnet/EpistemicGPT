@@ -46,6 +46,17 @@ Jiang Yu Nguwi∗ Nicolas Privault
 further estimations, calculations suggest that the LR on attention should be the MLP but divided by the highest width of the internal representation.
 in an OST model, its lr/3.
 
+for embedding layer, LR is allowed to be quite large.
+(1 / log(sqrt(max(dim, vocab))))*0.5
+
+for unembedding(assume we will parallelize, not accumulate sequential): 
+lr_unembed = (1 / (sqrt(n_slices + 1) * log(max(dim, vocab))))*0.5
+
+Scheduling should decay the entire model gradually to a lower bound.  that lowest possible bound that is useful to train is quite simply 1 / (1099.84 * sqrt(max(dim,vocab)).
+training below this may not be effective or useful. 
+
+any change to nonlinearities, any scaling operations, any use of softmax objectively will change and invalidate this prospective learning rate schedule. 
+
 
 '''
 import math
