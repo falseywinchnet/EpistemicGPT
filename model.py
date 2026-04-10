@@ -331,8 +331,6 @@ class Attention(nn.Module):
         alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
         self.register_buffer('k_alpha', alphas)
         self.sink_value = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
-        self.beta= 1/self.scale
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
         self.s_gate = nn.Linear(2, 1, bias=True)
         
@@ -372,7 +370,7 @@ class Attention(nn.Module):
         # Soft Attention
 
         mask = self.mask[:, :, :T, :T]
-        soft_scores = self.beta  * F.softplus(self.scale* scores) #zero point mass is log(2)/alpha or ~0.382.
+        soft_scores = F.softplus(scores) #zero point mass is log(2)/alpha or ~0.382.
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
         threshold = 1e-6
@@ -484,8 +482,7 @@ class SoftplusCELoss(nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
-        self.scale = math.pi / math.sqrt(3.0) #logistic CDF matched scale beats gelu and is less expensive
-        self.beta = 1/self.scale
+
 
     def forward(self, logits, targets):
         # logits: (B, V) or (B, T, V)
@@ -500,8 +497,7 @@ class SoftplusCELoss(nn.Module):
         if flat_targets.numel() == 0:
             return flat_logits.sum() * 0.0
 
-        # softplus "probabilities" -- same mechanism as your attention
-        sp = self.beta * F.softplus(self.scale * flat_logits)
+        sp = F.softplus( flat_logits)
 
         threshold = 1e-6
         pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
