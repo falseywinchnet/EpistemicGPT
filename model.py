@@ -357,14 +357,17 @@ class Attention(nn.Module):
         )
 
 
-        self.q_proj = nn.Linear(dim,dim,bias=False)
+        self.q_proj = MLP(config)
         self.k_proj = nn.Linear(dim,dim,bias=False)
         self.v_proj = nn.Linear(dim,dim,bias=False)
-        self.o_mlp = MLP(config)
+        self.o_mlp = nn.Linear(dim,dim,bias=False)
         self.s_mlp = MLP(config)
+        self.p_mlp = MLP(config)
+
+        self.v_sink_basis_true = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
 
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-
+        self.uncertainty_vec = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
         limit = config.block_size // 2
@@ -375,6 +378,22 @@ class Attention(nn.Module):
         self.register_buffer('k_alpha', alphas)
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
         self.s_gate = nn.Linear(2, 1, bias=True)
+
+    def erode(self,B, H, T, device):
+        alpha=0.3
+        sigma_frac=0.5
+        protect_frac=0.5
+        indices = torch.arange(T, device=device)
+        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
+        
+        sigma = T * sigma_frac
+        drop_probs = alpha * torch.exp(-(dist ** 2) / (2 * sigma ** 2))
+        
+        limit = int(T * protect_frac)
+        drop_probs = drop_probs.masked_fill(dist > limit, 0.0)
+        
+        keep_mask = torch.bernoulli(1.0 - drop_probs.unsqueeze(0).unsqueeze(0).expand(B, H, T, T))
+        return keep_mask
         
     def forward(self, x):
         B, T, C = x.shape
@@ -437,23 +456,78 @@ class Attention(nn.Module):
         s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
 
         y_clean = y_context - self_weight * v
-        y_clean = y_clean * mix_signal
-        y_true = F.rms_norm(y_clean, (D,))
+        y_clean = y_clean * mix_signal 
+        y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
         # y is (B, H, T, D)
-        y_next = delta + self.v_sink_basis * s_conf
-        y_next =  F.rms_norm(y_next, (D,))
+        y_next = delta + self.uncertainty_vec * s_conf
+        y_next =  F.rms_norm(y_next, (D,))+ self.v_sink_basis
 
-        # Position / Objective / Support / Transport
-        #P is implied - it lives in the residual
+
+        p = y_true * y_next
+        # Position / Objective / Support
 
         O_flat = y_next.transpose(1, 2).contiguous().view(B, T, -1)
         S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
+        P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
 
-        return (
-              self.o_mlp(O_flat)
-            + self.s_mlp(S_flat)
-        )
+        truth = self.o_mlp(O_flat)+ self.s_mlp(S_flat) + self.p_mlp(P_flat)
 
+        if not self.training:
+            return truth
+        else:
+            mask = self.erode(B,H,T,x.device)
+            soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
+            soft_sums = soft_scores.sum(dim=-1, keepdim=True)
+            scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
+            attn = soft_scores * scale
+            attn = torch.nan_to_num(attn, nan=0.0)
+    
+            y_context = attn @ v
+            v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
+            delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
+            #delta = y_context - v OR: 
+            # === Mixing tensor: variance of the attended distribution ===
+            v_sq = attn @ (v * v)  # E[v^2] under attention weights
+            mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+            # ===  sinking ===
+            pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
+            query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
+            
+            # relative distance attended to, normalized to [0, 1]
+            # 0 = attending to self, 1 = attending to position 0
+            rel_dist = (query_pos - pos).clamp(min=0) / query_pos.clamp(min=1)
+            
+            # first moment: where is attention centered? (B, H, T, 1)
+            mu = (attn * rel_dist).sum(dim=-1, keepdim=True)
+            
+            # second moment: how spread is it? (B, H, T, 1)
+            var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
+    
+            #XSA-like but purely self-term
+            self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
+            self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
+    
+    
+            s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
+    
+            y_clean = y_context - self_weight * v
+            y_clean = y_clean * mix_signal 
+            y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
+            # y is (B, H, T, D)
+            y_next = delta + self.uncertainty_vec * s_conf
+            y_next =  F.rms_norm(y_next, (D,))+ self.v_sink_basis
+    
+            p = y_true * y_next
+            # Position / Objective / Support
+    
+            O_flat = y_next.transpose(1, 2).contiguous().view(B, T, -1)
+            S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
+            P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
+
+            tangent = self.o_mlp(O_flat)+ self.s_mlp(S_flat)+ self.p_mlp(P_flat)
+            truth = tangent + (truth - tangent).detach()
+
+        return truth
 
 
 
@@ -567,22 +641,6 @@ class SubspaceUnembed(nn.Module):
 
         return logits
 
-def make_gaussian_drop_fn(alpha=0.3, sigma_frac=0.5, protect_frac=0.5):
-    def drop_prob_fn(B, H, T, device):
-        indices = torch.arange(T, device=device)
-        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
-        
-        sigma = T * sigma_frac
-        drop_probs = alpha * torch.exp(-(dist ** 2) / (2 * sigma ** 2))
-        
-        limit = int(T * protect_frac)
-        drop_probs = drop_probs.masked_fill(dist > limit, 0.0)
-        
-        keep_mask = torch.bernoulli(1.0 - drop_probs.unsqueeze(0).unsqueeze(0).expand(B, H, T, T))
-        return keep_mask
-    
-    return drop_prob_fn
-
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -650,6 +708,7 @@ class GPT(nn.Module):
 
         for i, block in enumerate(self.transformer.h):
             x = block(x)
+
         x = norm(x)
         if targets is not None:
             logits = self.lm_head(x)
