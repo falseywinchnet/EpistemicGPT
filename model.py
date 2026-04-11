@@ -357,10 +357,10 @@ class Attention(nn.Module):
         )
 
 
-        self.q_proj = MLP(config)
+        self.q_proj = MLP_wide(config)
         self.k_proj = nn.Linear(dim,dim,bias=False)
         self.v_proj = nn.Linear(dim,dim,bias=False)
-        self.s_mlp = MLP(config)
+        self.s_mlp = MLP_wide(config)
         self.delta_proj = nn.Linear(self.head_dim,self.head_dim,bias=False)
         self.v_sink_basis_true = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
 
@@ -455,7 +455,10 @@ class Attention(nn.Module):
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
         mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
-        delta = delta * mix_signal
+        delta = delta * mix_signal 
+        if delta_prev is not None:
+
+            delta = delta + delta_prev
         # ===  sinking ===
         pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
         query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
@@ -470,9 +473,7 @@ class Attention(nn.Module):
 
 
         s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
-        vn = F.normalize(v, dim=-1)
-        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
-
+       
         y_clean = y_context * s_conf 
         y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
         
@@ -482,59 +483,8 @@ class Attention(nn.Module):
 
         truth = self.s_mlp(S_flat)
 
-        if not self.training:
-            return truth
-        else:
-            mask = self.erode(B,H,T,x.device)
-            soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
-            soft_sums = soft_scores.sum(dim=-1, keepdim=True)
-            scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
-            attn = soft_scores * scale
-            attn = torch.nan_to_num(attn, nan=0.0)
-    
-            y_context = attn @ v
-            v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
-            delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
-                    #XSA-like but purely self-term
-            self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
-            self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
-            delta = delta - self_weight * v
-            
-            #delta = y_context - v OR: 
-            # === Mixing tensor: variance of the attended distribution ===
-            v_sq = attn @ (v * v)  # E[v^2] under attention weights
-            mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
-            delta = delta * mix_signal
-            # ===  sinking ===
-            pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
-            query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
-            rel_dist = (query_pos - pos).clamp(min=0) / query_pos.clamp(min=1)
-            
-            # first moment: where is attention centered? (B, H, T, 1)
-            mu = (attn * rel_dist).sum(dim=-1, keepdim=True)
-            
-            # second moment: how spread is it? (B, H, T, 1)
-            var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
-    
-    
-    
-            s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
-            vn = F.normalize(v, dim=-1)
-            y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
-    
-            y_clean = y_context * s_conf 
-            y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
-            
-    
-            S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
-            #P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
-
-            tangent = self.s_mlp(S_flat)
-    
-            return tangent + (truth - tangent).detach()
-
-
-
+        return truth,delta
+        
 def norm(x):
     return F.rms_norm(x, (x.size(-1),),eps=1e-6)
 
@@ -545,14 +495,14 @@ class Block(nn.Module):
         self.attn_dir = MLP_bottle(config)
         self.config = config
 
-    def forward(self, x):
+    def forward(self, x,d_next=None):
         a = norm(x)
-        z = self.attn(a)
+        z,d_next = self.attn(a)
         vn = F.normalize(self.attn_dir(a), dim=-1)
         q = x - (x * vn).sum(dim=-1, keepdim=True) * vn
         x = q + z
 
-        return x
+        return x,d_next
 
     
 
@@ -687,8 +637,11 @@ class ParallelSubspaceUnembed(nn.Module):
     
             if count > 0:
                 sep_loss = sep_loss / count
+        if self.training:
 
-        return logits, sep_loss
+            return logits, sep_loss
+        else:
+            return logits
 
 import math
 from dataclasses import dataclass
@@ -946,7 +899,7 @@ class GPT(nn.Module):
         self._linear_states = {}
         #self.register_confined_backward() experiment with at LATER TIME
         self.criterion = SoftplusCELoss(ignore_index=-1)
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+        self.lm_head = ParallelSubspaceUnembed(config.n_embd, config.vocab_size)
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
 
@@ -982,14 +935,14 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
-
+        d_next=None
         for i, block in enumerate(self.transformer.h):
-            x = block(x)
+            x,d_next= block(x,d_next)
 
         x = norm(x)
         if targets is not None:
-            logits  = self.lm_head(x)
-            loss = self.criterion(logits, targets) 
+            logits, aux_loss = self.lm_head(x)
+            loss = self.criterion(logits, targets) +0.01*aux_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
