@@ -360,10 +360,8 @@ class Attention(nn.Module):
         self.q_proj = MLP(config)
         self.k_proj = nn.Linear(dim,dim,bias=False)
         self.v_proj = nn.Linear(dim,dim,bias=False)
-        self.o_mlp = nn.Linear(dim,dim,bias=False)
         self.s_mlp = MLP(config)
-        self.p_mlp = MLP(config)
-
+        self.delta_proj = nn.Linear(self.head_dim,self.head_dim,bias=False)
         self.v_sink_basis_true = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
 
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
@@ -379,23 +377,35 @@ class Attention(nn.Module):
         self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
         self.s_gate = nn.Linear(2, 1, bias=True)
 
-    def erode(self,B, H, T, device):
-        alpha=0.3
-        sigma_frac=0.5
-        protect_frac=0.5
-        indices = torch.arange(T, device=device)
-        dist = (indices.view(-1, 1) - indices.view(1, -1)).float().clamp(min=0)
-        
-        sigma = T * sigma_frac
-        drop_probs = alpha * torch.exp(-(dist ** 2) / (2 * sigma ** 2))
-        
-        limit = int(T * protect_frac)
-        drop_probs = drop_probs.masked_fill(dist > limit, 0.0)
-        
-        keep_mask = torch.bernoulli(1.0 - drop_probs.unsqueeze(0).unsqueeze(0).expand(B, H, T, T))
+    def erode(self, B, H, T, device):
+        alpha = 0.3
+        sigma_frac = 0.18
+    
+        pos = torch.arange(T, device=device).float()              # [T]
+    
+        # spread head preferences across sequence: early -> middle -> late
+        head_centers = torch.linspace(0, T - 1, H, device=device) # [H]
+    
+        # distance of each source position from each head's preferred region
+        src_dist = pos.view(1, 1, T) - head_centers.view(H, 1, 1) # [H,1,T]
+        src_dist = src_dist.expand(H, T, T).abs()                 # [H,T,T]
+    
+        sigma = max(T * sigma_frac, 1.0)
+    
+        # highest drop away from preferred region, lowest drop near it
+        drop_probs = alpha * (1.0 - torch.exp(-(src_dist ** 2) / (2 * sigma ** 2)))
+    
+        # keep causal structure
+        causal = torch.tril(torch.ones(T, T, device=device))
+        drop_probs = drop_probs * causal.unsqueeze(0)
+        keep_probs = 1.0 - drop_probs
+    
+        keep_mask = torch.bernoulli(
+            keep_probs.unsqueeze(0).expand(B, H, T, T)
+        )
         return keep_mask
         
-    def forward(self, x):
+    def forward(self, x, delta_prev=None):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
 
@@ -403,7 +413,13 @@ class Attention(nn.Module):
         k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-        
+           # === V projection with delta composition ===
+        v_base = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+        if delta_prev is not None:
+            v_combined = v_base + self.delta_proj(delta_prev)
+        else:
+            v_combined = v_base
+        v = v_combined
         q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
@@ -430,16 +446,19 @@ class Attention(nn.Module):
         y_context = attn @ v
         v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
         delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
+                #XSA-like but purely self-term
+        self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
+        self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
+        delta = delta - self_weight * v
+        
         #delta = y_context - v OR: 
         # === Mixing tensor: variance of the attended distribution ===
         v_sq = attn @ (v * v)  # E[v^2] under attention weights
         mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+        delta = delta * mix_signal
         # ===  sinking ===
         pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
         query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
-        
-        # relative distance attended to, normalized to [0, 1]
-        # 0 = attending to self, 1 = attending to position 0
         rel_dist = (query_pos - pos).clamp(min=0) / query_pos.clamp(min=1)
         
         # first moment: where is attention centered? (B, H, T, 1)
@@ -448,29 +467,20 @@ class Attention(nn.Module):
         # second moment: how spread is it? (B, H, T, 1)
         var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
 
-        #XSA-like but purely self-term
-        self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
-        self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
 
 
         s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
+        vn = F.normalize(v, dim=-1)
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
 
-        y_clean = y_context - self_weight * v
-        y_clean = y_clean * mix_signal 
+        y_clean = y_context * s_conf 
         y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
-        # y is (B, H, T, D)
-        y_next = delta + self.uncertainty_vec * s_conf
-        y_next =  F.rms_norm(y_next, (D,))+ self.v_sink_basis
+        
 
-
-        p = y_true * y_next
-        # Position / Objective / Support
-
-        O_flat = y_next.transpose(1, 2).contiguous().view(B, T, -1)
         S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
-        P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
+        #P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
 
-        truth = self.o_mlp(O_flat)+ self.s_mlp(S_flat) + self.p_mlp(P_flat)
+        truth = self.s_mlp(S_flat)
 
         if not self.training:
             return truth
@@ -485,16 +495,19 @@ class Attention(nn.Module):
             y_context = attn @ v
             v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
             delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
+                    #XSA-like but purely self-term
+            self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
+            self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
+            delta = delta - self_weight * v
+            
             #delta = y_context - v OR: 
             # === Mixing tensor: variance of the attended distribution ===
             v_sq = attn @ (v * v)  # E[v^2] under attention weights
             mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
+            delta = delta * mix_signal
             # ===  sinking ===
             pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
             query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
-            
-            # relative distance attended to, normalized to [0, 1]
-            # 0 = attending to self, 1 = attending to position 0
             rel_dist = (query_pos - pos).clamp(min=0) / query_pos.clamp(min=1)
             
             # first moment: where is attention centered? (B, H, T, 1)
@@ -503,31 +516,22 @@ class Attention(nn.Module):
             # second moment: how spread is it? (B, H, T, 1)
             var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
     
-            #XSA-like but purely self-term
-            self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
-            self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
     
     
             s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
+            vn = F.normalize(v, dim=-1)
+            y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
     
-            y_clean = y_context - self_weight * v
-            y_clean = y_clean * mix_signal 
+            y_clean = y_context * s_conf 
             y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
-            # y is (B, H, T, D)
-            y_next = delta + self.uncertainty_vec * s_conf
-            y_next =  F.rms_norm(y_next, (D,))+ self.v_sink_basis
+            
     
-            p = y_true * y_next
-            # Position / Objective / Support
-    
-            O_flat = y_next.transpose(1, 2).contiguous().view(B, T, -1)
             S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
-            P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
+            #P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
 
-            tangent = self.o_mlp(O_flat)+ self.s_mlp(S_flat)+ self.p_mlp(P_flat)
-            truth = tangent + (truth - tangent).detach()
-
-        return truth
+            tangent = self.s_mlp(S_flat)
+    
+            return tangent + (truth - tangent).detach()
 
 
 
@@ -611,36 +615,312 @@ class SoftplusCELoss(nn.Module):
 
         
 
-class SubspaceUnembed(nn.Module):
-    def __init__(self, d_model, vocab_size, n_slices=4):
+class ParallelSubspaceUnembed(nn.Module):
+    """
+    Parallel carveouts against the same h.
+    Diversity is enforced only through cosine-distinct subspaces.
+
+    Each slice owns:
+      - a direction net that proposes a subspace direction
+      - a vocab projection for the carved component
+
+    Output:
+      logits: summed vocab logits from all slices (+ residual head if enabled)
+      sep_loss: pairwise squared cosine overlap penalty between slice directions
+    """
+    def __init__(self, d_model, vocab_size, n_slices=4, use_residual_head=True, eps=1e-6):
         super().__init__()
+        self.d_model = d_model
+        self.vocab_size = vocab_size
         self.n_slices = n_slices
-        self.sub_d = d_model // n_slices
-        assert d_model % n_slices == 0
+        self.use_residual_head = use_residual_head
+        self.eps = eps
 
         self.dir_nets = nn.ModuleList([
             nn.Linear(d_model, d_model, bias=False)
             for _ in range(n_slices)
         ])
         self.projs = nn.ModuleList([
-             nn.Linear(d_model, vocab_size, bias=False)
-            for _ in range(n_slices + 1)
+            nn.Linear(d_model, vocab_size, bias=False)
+            for _ in range(n_slices)
         ])
 
+        if use_residual_head:
+            self.residual_proj = nn.Linear(d_model, vocab_size, bias=False)
+        else:
+            self.residual_proj = None
+
     def forward(self, h):
-        logits = 0
-        residual = h
+        # h: [B, T, D]
+        B, T, D = h.shape
+        assert D == self.d_model
+
+        logits = 0.0
+        dirs = []
+        components = []
+
         for i in range(self.n_slices):
-            vn = F.normalize(self.dir_nets[i](h), dim=-1,eps=1e-6)
-            component = (residual * vn).sum(dim=-1, keepdim=True) * vn
-            residual = residual - component
-            logits = logits + self.projs[i](component)
+            v = self.dir_nets[i](h)                            # [B,T,D]
+            v = F.normalize(v, dim=-1, eps=self.eps)          # unit direction
+            c = (h * v).sum(dim=-1, keepdim=True) * v         # projection of h onto v
 
-        # Add a new line here
-        logits = logits + self.projs[-1](residual)
+            dirs.append(v)
+            components.append(c)
+            logits = logits + self.projs[i](c)
 
-        return logits
+        if self.use_residual_head:
+            used = torch.stack(components, dim=0).sum(dim=0)  # [B,T,D]
+            residual = h - used
+            logits = logits + self.residual_proj(residual)
 
+        # pairwise squared cosine overlap penalty
+        # because v_i, v_j are normalized, dot(v_i, v_j) is cosine
+        sep_loss = h.new_zeros(())
+
+        if self.training:
+            count = 0
+            for i in range(self.n_slices):
+                for j in range(i + 1, self.n_slices):
+                    cos_ij = (dirs[i] * dirs[j]).sum(dim=-1)      # [B,T]
+                    sep_loss = sep_loss + (cos_ij ** 2).mean()
+                    count += 1
+    
+            if count > 0:
+                sep_loss = sep_loss / count
+
+        return logits, sep_loss
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def bit_width(vocab_size: int) -> int:
+    return max(1, math.ceil(math.log2(vocab_size)))
+
+
+def hamming_parity_bits(m: int) -> int:
+    r = 0
+    while (2 ** r) < (m + r + 1):
+        r += 1
+    return r
+
+
+def int_to_bits(x: torch.Tensor, width: int) -> torch.Tensor:
+    shifts = torch.arange(width, device=x.device)
+    return ((x.unsqueeze(-1) >> shifts) & 1).float()
+
+
+def hamming_encode_bits(data_bits: torch.Tensor) -> torch.Tensor:
+    m = data_bits.shape[-1]
+    r = hamming_parity_bits(m)
+    n = m + r
+
+    out = torch.zeros(*data_bits.shape[:-1], n, dtype=data_bits.dtype, device=data_bits.device)
+
+    data_idx = 0
+    for pos in range(1, n + 1):
+        if (pos & (pos - 1)) != 0:
+            out[..., pos - 1] = data_bits[..., data_idx]
+            data_idx += 1
+
+    for i in range(r):
+        p = 2 ** i
+        parity = torch.zeros(*data_bits.shape[:-1], dtype=data_bits.dtype, device=data_bits.device)
+        for pos in range(1, n + 1):
+            if (pos & p) and (pos != p):
+                parity = torch.remainder(parity + out[..., pos - 1], 2.0)
+        out[..., p - 1] = parity
+
+    return out
+
+
+class BinaryHammingPath(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, use_hamming: bool = True):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.data_bits = bit_width(vocab_size)
+        self.parity_bits = hamming_parity_bits(self.data_bits) if use_hamming else 0
+        self.code_bits = self.data_bits + self.parity_bits
+        self.proj = nn.Linear(self.code_bits, d_model, bias=False)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if input_ids.dtype not in (torch.int32, torch.int64):
+            raise TypeError("input_ids must be int32 or int64")
+        if input_ids.min() < 0 or input_ids.max() >= self.vocab_size:
+            raise ValueError("input_ids out of range")
+
+        bits = int_to_bits(input_ids, self.data_bits)
+        if self.parity_bits > 0:
+            bits = hamming_encode_bits(bits)
+        return self.proj(bits)
+
+
+class FlatRollGeometry(nn.Module):
+    """
+    Exact construction in vocab space (V x V), then interpolate row-wise to d_model.
+    This preserves unique token positions in vocab coordinates, then adapts to model width.
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        scale: str = "box",
+        seed: int = 0,
+        freeze: bool = True,
+        dtype: torch.dtype = torch.float32,
+        device=None,
+    ):
+        super().__init__()
+        V = int(vocab_size)
+        Dv = V
+        eps = 1e-12
+
+        g = torch.Generator(device="cpu")
+        g.manual_seed(seed)
+
+        x = self._make_base(Dv, scale=scale, generator=g, dtype=dtype)  # [V]
+
+        shifts = torch.arange(V)
+        rows = [torch.roll(x, shifts=int(s.item() % Dv), dims=0) for s in shifts]
+        W = torch.stack(rows, dim=0).to(dtype)  # [V, V]
+
+        M = int(torch.argmax(x))
+        pm = x[M].item()
+        N = 1.0 / (pm + eps)
+
+        r_idx = torch.arange(V)
+        c_idx = (r_idx + M) % Dv
+        S = torch.zeros((V, Dv), dtype=dtype)
+        S[r_idx, c_idx] = N
+
+        exact_vocab_geom = W + S  # [V, V]
+
+        if d_model != V:
+            interp = F.interpolate(
+                exact_vocab_geom.unsqueeze(1),   # [V,1,V]
+                size=d_model,
+                mode="linear",
+                align_corners=False,
+            ).squeeze(1)                         # [V,d_model]
+        else:
+            interp = exact_vocab_geom
+
+        interp = interp.to(dtype=dtype)
+        if device is not None:
+            interp = interp.to(device)
+
+        self.embed = nn.Embedding.from_pretrained(interp, freeze=freeze)
+
+    @staticmethod
+    def _make_base(
+        D: int,
+        scale: str = "box",
+        generator: torch.Generator | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        if dtype in (torch.float16, torch.bfloat16, torch.float32):
+            complex_dtype = torch.complex64
+            work_float = torch.float32
+        else:
+            complex_dtype = torch.complex128
+            work_float = torch.float64
+
+        X = torch.zeros(D, dtype=complex_dtype)
+        X[0] = torch.tensor(0, dtype=complex_dtype)
+
+        if D % 2 == 0:
+            for k in range(1, D // 2):
+                phi = torch.rand((), generator=generator, dtype=work_float) * (2 * math.pi)
+                val = (torch.cos(phi) + 1j * torch.sin(phi)).to(complex_dtype)
+                X[k] = val
+                X[D - k] = torch.conj(val)
+            X[D // 2] = 1.0 if torch.rand((), generator=generator) < 0.5 else -1.0
+        else:
+            for k in range(1, (D - 1) // 2 + 1):
+                phi = torch.rand((), generator=generator, dtype=work_float) * (2 * math.pi)
+                val = (torch.cos(phi) + 1j * torch.sin(phi)).to(complex_dtype)
+                X[k] = val
+                X[D - k] = torch.conj(val)
+
+        x = torch.fft.ifft(X).real.to(work_float)
+
+        if scale == "unit":
+            x = x / (x.norm() + 1e-12)
+        elif scale == "box":
+            x = x / (x.abs().max() + 1e-12)
+        else:
+            raise ValueError("scale must be 'unit' or 'box'")
+
+        return x.to(dtype)
+
+
+
+class ThreePieceEmbedding(nn.Module):
+    """
+    final = (binary_path + cayley_path) * (1 + alpha * geometry_path)
+
+    binary_path: identity / fingerprint
+    cayley_path: structured deformational coordinates
+    geometry_path: fixed atlas scaffold
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        bottleneck_width: int = 16,
+        cayley_expansions: int = 3,
+        use_hamming: bool = True,
+        geom_scale: str = "box",
+        geom_seed: int = 0,
+        geom_freeze: bool = True,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+
+        self.binary = BinaryHammingPath(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            use_hamming=use_hamming,
+        )
+
+        self.embd = nn.Embedding(vocab_size,d_model)
+
+        self.geometry = FlatRollGeometry(
+            vocab_size=vocab_size,
+            d_model=d_model,
+            scale=geom_scale,
+            seed=geom_seed,
+            freeze=geom_freeze,
+        )
+
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        e_bin = self.binary(input_ids)          # [B,T,d]
+        e_embd = self.embd(input_ids)          # [B,T,d]
+        e_geo = self.geometry.embed(input_ids)  # [B,T,d]
+
+        base = e_bin + e_geo
+        #out = base + e_embd
+        return base
+
+'''
+ThreePieceEmbedding(
+                vocab_size=config.vocab_size,
+                d_model=config.n_embd,
+                bottleneck_width=16,#something close to the binary width
+                cayley_expansions=3,
+                use_hamming=True,
+                geom_scale="box",
+                geom_seed=0,
+                geom_freeze=True),
+
+
+'''
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -650,7 +930,7 @@ class GPT(nn.Module):
         self.config.rope = self.rope
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+        wte=nn.Embedding(config.vocab_size,config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(self.config,i) for i in range(config.n_layer)]),
         ))
@@ -666,8 +946,7 @@ class GPT(nn.Module):
         self._linear_states = {}
         #self.register_confined_backward() experiment with at LATER TIME
         self.criterion = SoftplusCELoss(ignore_index=-1)
-        self.lm_head = SubspaceUnembed(config.n_embd, config.vocab_size,config.n_layer)
-        self._drop_prob_fn = make_gaussian_drop_fn(alpha=0.3, sigma_frac=0.5, protect_frac=0.5)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
 
@@ -697,10 +976,8 @@ class GPT(nn.Module):
         
 
 
-    def get_num_params(self, non_embedding=True):
+    def get_num_params(self):
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wte.weight.numel()
         return n_params
     def forward(self, idx, targets=None):
         b, T = idx.size()
@@ -711,8 +988,8 @@ class GPT(nn.Module):
 
         x = norm(x)
         if targets is not None:
-            logits = self.lm_head(x)
-            loss = self.criterion(logits, targets)
+            logits  = self.lm_head(x)
+            loss = self.criterion(logits, targets) 
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
