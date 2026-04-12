@@ -352,30 +352,18 @@ class Attention(nn.Module):
         self.n_embd = config.n_embd
         dim = config.n_embd
         self.head_dim = dim // self.n_heads
-        self.skew_basis = nn.Parameter(
-            torch.randn(self.n_heads, self.head_dim, self.head_dim) * 0.02
-        )
+        
 
-
-        self.q_proj = MLP_wide(config)
+        self.q_proj = nn.Linear(dim,dim,bias=False)
         self.k_proj = nn.Linear(dim,dim,bias=False)
-        self.v_proj = nn.Linear(dim,dim,bias=False)
-        self.s_mlp = MLP_wide(config)
-        self.delta_proj = nn.Linear(self.head_dim,self.head_dim,bias=False)
-        self.v_sink_basis_true = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-
+        self.v_proj =nn.Linear(dim,dim,bias=False)
+        self.o_proj =nn.Linear(dim,dim,bias=False)
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
-        self.uncertainty_vec = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
+        self.sink_key = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
+
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
-        limit = config.block_size // 2
 
-        self.sd_alpha = 0.3
-        self.sd_sigma = config.block_size / 2.0
-        alphas = torch.linspace(0, 1, self.n_heads).view(1, self.n_heads, 1, 1)
-        self.register_buffer('k_alpha', alphas)
-        self.h = nn.Parameter(torch.randn(self.n_heads, self.head_dim, 1))
-        self.s_gate = nn.Linear(2, 1, bias=True)
 
     def erode(self, B, H, T, device):
         alpha = 0.3
@@ -412,77 +400,70 @@ class Attention(nn.Module):
       
         k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-           # === V projection with delta composition ===
-        v_base = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
         if delta_prev is not None:
-            v_combined = v_base + self.delta_proj(delta_prev)
+            e = x + delta_prev
         else:
-            v_combined = v_base
-        v = v_combined
+            e = x
+        v = self.v_proj(e).view(B, T, H, D).transpose(1, 2)
+
         q = F.rms_norm(q, (D,),eps=1e-6) #never ever norm k, you stupid fuck
 
         q = self.rope(q)
         k = self.rope(k)
-        scores = (q @ k.transpose(-2, -1)) * (math.log(T) * math.log(D))
+        k2 = torch.cat([k, self.sink_key.expand(B, -1, -1, -1)], dim=2)
+
+        scores = (q @ k2.transpose(-2, -1)) * (math.log(T+1) * math.log(D))
         # Soft Attention
 
         mask = self.mask[:, :, :T, :T]
+        null_col = torch.ones(1, 1, T, 1, device=x.device)
+        mask_use = torch.cat([mask, null_col], dim=-1) 
         soft_scores = F.softplus(scores) #zero point mass is log(2)/alpha or ~0.382.
         # STE: Forward sets small/neg values to 0, Backward ignores the zeroing
         # Values < 1e-6 do not participate in mass/scaling but receive gradients
         threshold = 1e-6
         pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
         soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
-        soft_scores = soft_scores.masked_fill(mask == 0, 0.0) #prevent cheating here
+        soft_scores = soft_scores.masked_fill(mask_use == 0, 0.0) #prevent cheating here
        
-
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
-
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
         attn = soft_scores * scale
         attn = torch.nan_to_num(attn, nan=0.0)
-
-        y_context = attn @ v
-        v_i = v.unsqueeze(-2)              # (B, H, T, 1, D)
-        delta = (attn.unsqueeze(-1) * (v.unsqueeze(-3) - v_i)).sum(dim=-2)
-                #XSA-like but purely self-term
-        self_weight = attn[..., torch.arange(T), torch.arange(T)]  # (B,H,T)
-        self_weight = self_weight.unsqueeze(-1)  # (B,H,T,1)
-        delta = delta - self_weight * v
+        attn_real = attn[:, :, :, :T]   # drop the null column
+        y_context = attn_real @ v
         
-        #delta = y_context - v OR: 
-        # === Mixing tensor: variance of the attended distribution ===
-        v_sq = attn @ (v * v)  # E[v^2] under attention weights
-        mix_signal = F.softplus(v_sq - y_context * y_context)  # Var[v] per dim, (B, H, T, D)
-        delta = delta * mix_signal 
-        if delta_prev is not None:
+        vn = F.normalize(v, dim=-1)
+        y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+        y = F.rms_norm(y_context, (D,)) + self.v_sink_basis    
+        y_flat = y.transpose(1, 2).contiguous().view(B, T, -1)
 
-            delta = delta + delta_prev
-        # ===  sinking ===
-        pos = torch.arange(T, device=x.device).float().view(1, 1, 1, T)
-        query_pos = torch.arange(T, device=x.device).float().view(1, 1, T, 1)
-        rel_dist = (query_pos - pos).clamp(min=0) / query_pos.clamp(min=1)
+        attn_flat = attn[:, :, :, :T].mean(dim=1)  # (B, T, T)
+        mixture = attn_flat @ x
+
+        xn = F.normalize(x, dim=-1)  # (B, T, C)
+        weighted_src = (attn_flat.unsqueeze(-1) * xn.unsqueeze(1)).sum(dim=2)  # (B, T, C)
+        weighted_src = F.normalize(weighted_src, dim=-1)
+        mutual = mixture - (mixture * weighted_src).sum(dim=-1, keepdim=True) * weighted_src
         
-        # first moment: where is attention centered? (B, H, T, 1)
-        mu = (attn * rel_dist).sum(dim=-1, keepdim=True)
+        truth = self.o_proj(y_flat)
+        mutual_n = F.normalize(mutual, dim=-1)
+        delta = truth - (truth * mutual_n).sum(dim=-1, keepdim=True) * mutual_n
+
+        if self.training:
+            mod_mask = self.erode(B,H,T,x.device)
+            mask =  mask.masked_fill(mod_mask == 0, 0.0)
+            eroded_attn  = attn_real.masked_fill(mask == 0, 0.0)
         
-        # second moment: how spread is it? (B, H, T, 1)
-        var = (attn * (rel_dist - mu).pow(2)).sum(dim=-1, keepdim=True)
+            y_context =eroded_attn @ v
+            y_context = y_context - (y_context * vn).sum(dim=-1, keepdim=True) * vn
+            y = F.rms_norm(y_context, (D,)) + self.v_sink_basis    
+            y_flat = y.transpose(1, 2).contiguous().view(B, T, -1)
 
+            tangent= self.o_proj(y_flat)
+            truth = tangent + (truth - tangent).detach()
 
-
-        s_conf = torch.sigmoid(self.s_gate(torch.cat([mu, var], dim=-1)))
-       
-        y_clean = y_context * s_conf 
-        y_true = F.rms_norm(y_clean, (D,))+ self.v_sink_basis_true
         
-
-        S_flat = y_true.transpose(1, 2).contiguous().view(B, T, -1)
-        #P_flat = p.transpose(1, 2).contiguous().view(B, T, -1)
-
-        truth = self.s_mlp(S_flat)
-
         return truth,delta
         
 def norm(x):
@@ -565,25 +546,38 @@ class SoftplusCELoss(nn.Module):
 
         
 
+
 class ParallelSubspaceUnembed(nn.Module):
     """
     Parallel carveouts against the same h.
     Diversity is enforced only through cosine-distinct subspaces.
-
     Each slice owns:
       - a direction net that proposes a subspace direction
       - a vocab projection for the carved component
-
+    Vocab dropout: during training, each proj randomly masks a fraction of
+    vocab entries, with the constraint that every vocab entry is covered by
+    at least one slice. This prevents attention from relying on any specific
+    unembedding pathway and forces compositional work back into attention.
     Output:
       logits: summed vocab logits from all slices (+ residual head if enabled)
       sep_loss: pairwise squared cosine overlap penalty between slice directions
     """
-    def __init__(self, d_model, vocab_size, n_slices=4, use_residual_head=True, eps=1e-6):
+
+    def __init__(
+        self,
+        d_model,
+        vocab_size,
+        n_slices=4,
+        use_residual_head=True,
+        vocab_dropout=0.25,
+        eps=1e-6,
+    ):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
         self.n_slices = n_slices
         self.use_residual_head = use_residual_head
+        self.vocab_dropout = vocab_dropout
         self.eps = eps
 
         self.dir_nets = nn.ModuleList([
@@ -600,45 +594,89 @@ class ParallelSubspaceUnembed(nn.Module):
         else:
             self.residual_proj = None
 
+    def _sample_vocab_masks(self, device):
+        """
+        For each slice, independently drop vocab_dropout fraction of vocab entries.
+        Then fix up: any vocab entry that got dropped from ALL slices gets
+        restored in one randomly chosen slice.
+
+        Returns: list of n_slices boolean tensors, each [vocab_size],
+                 True = keep, False = dropped.
+        """
+        # each slice independently keeps (1 - vocab_dropout) fraction
+        masks = [
+            torch.rand(self.vocab_size, device=device) > self.vocab_dropout
+            for _ in range(self.n_slices)
+        ]
+
+        # stack to [n_slices, vocab_size] for coverage check
+        stacked = torch.stack(masks, dim=0)  # [n_slices, V]
+        uncovered = ~stacked.any(dim=0)      # [V] -- True where ALL slices dropped
+
+        if uncovered.any():
+            # for each uncovered vocab entry, randomly assign to one slice
+            uncovered_idx = uncovered.nonzero(as_tuple=True)[0]
+            assignments = torch.randint(
+                0, self.n_slices, (uncovered_idx.shape[0],), device=device
+            )
+            for s in range(self.n_slices):
+                restore = uncovered_idx[assignments == s]
+                if restore.numel() > 0:
+                    masks[s][restore] = True
+
+        return masks
+
     def forward(self, h):
         # h: [B, T, D]
         B, T, D = h.shape
         assert D == self.d_model
 
-        logits = 0.0
+        logits = h.new_zeros(B, T, self.vocab_size)
         dirs = []
         components = []
 
+        # sample vocab masks once per forward pass
+        if self.training and self.vocab_dropout > 0:
+            vocab_masks = self._sample_vocab_masks(h.device)
+        else:
+            vocab_masks = None
+
         for i in range(self.n_slices):
             v = self.dir_nets[i](h)                            # [B,T,D]
-            v = F.normalize(v, dim=-1, eps=self.eps)          # unit direction
-            c = (h * v).sum(dim=-1, keepdim=True) * v         # projection of h onto v
+            v = F.normalize(v, dim=-1, eps=self.eps)           # unit direction
+            c = (h * v).sum(dim=-1, keepdim=True) * v          # projection of h onto v
 
             dirs.append(v)
             components.append(c)
-            logits = logits + self.projs[i](c)
+
+            slice_logits = self.projs[i](c)                    # [B,T,V]
+
+            if vocab_masks is not None:
+                # mask is [V], broadcast to [1,1,V]
+                # scale kept logits to compensate for missing slices
+                mask = vocab_masks[i].unsqueeze(0).unsqueeze(0).float()
+                slice_logits = slice_logits * mask / (1.0 - self.vocab_dropout + self.eps)
+
+            logits = logits + slice_logits
 
         if self.use_residual_head:
-            used = torch.stack(components, dim=0).sum(dim=0)  # [B,T,D]
+            used = torch.stack(components, dim=0).sum(dim=0)   # [B,T,D]
             residual = h - used
             logits = logits + self.residual_proj(residual)
 
         # pairwise squared cosine overlap penalty
-        # because v_i, v_j are normalized, dot(v_i, v_j) is cosine
         sep_loss = h.new_zeros(())
-
         if self.training:
             count = 0
             for i in range(self.n_slices):
                 for j in range(i + 1, self.n_slices):
-                    cos_ij = (dirs[i] * dirs[j]).sum(dim=-1)      # [B,T]
+                    cos_ij = (dirs[i] * dirs[j]).sum(dim=-1)   # [B,T]
                     sep_loss = sep_loss + (cos_ij ** 2).mean()
                     count += 1
-    
             if count > 0:
                 sep_loss = sep_loss / count
-        if self.training:
 
+        if self.training:
             return logits, sep_loss
         else:
             return logits
