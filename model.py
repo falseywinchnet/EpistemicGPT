@@ -1207,6 +1207,6 @@ class GPT(nn.Module):
             logits, aux_loss = self.lm_head(x)
             loss = self.criterion(logits, targets) + 0.01 * aux_loss
         else:
-            result = self.lm_head(x[:, [-1], :])
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
         return logits, loss
