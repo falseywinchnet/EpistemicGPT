@@ -11,6 +11,146 @@ import math
 #it may or may not work, we are still experimenting with it.
 #its intent is to condition models to develop contextual continuation knowledge that is concept-local.
 
+
+# copyright 2026 joshuah.rainstar@gmail.com MIT licensed
+# ETF initialization for ContextualEmbed
+# Replaces random Gaussian buffers with simplex ETF structured projections
+
+import torch
+import math
+
+
+def simplex_etf(num_vectors: int, dim: int) -> torch.Tensor:
+    """
+    Construct a simplex ETF: num_vectors unit vectors in R^dim
+    with equal pairwise cosine similarity = -1/(num_vectors - 1).
+    
+    Requires dim >= num_vectors - 1.
+    
+    Returns: (num_vectors, dim) tensor of unit vectors.
+    """
+    assert dim >= num_vectors - 1, (
+        f"Need dim >= num_vectors-1 for perfect ETF, got dim={dim}, K={num_vectors}"
+    )
+    # Start with the K x K centered identity
+    K = num_vectors
+    I_K = torch.eye(K)
+    ones = torch.ones(K, 1)
+    # M columns are the ETF vectors in R^K
+    # M = sqrt(K/(K-1)) * (I - 1/K * 11^T)
+    M = math.sqrt(K / (K - 1)) * (I_K - (1.0 / K) * (ones @ ones.T))
+    # M is K x K with rank K-1. The vectors live in a (K-1)-dimensional subspace.
+    # Embed into R^dim by padding with zeros then rotating with a fixed orthogonal basis.
+    if dim > K:
+        padding = torch.zeros(K, dim - K)
+        M = torch.cat([M, padding], dim=1)  # (K, dim)
+    elif dim == K:
+        pass  # already correct shape
+    # M rows are now unit vectors in R^dim (they already have unit norm from the ETF construction)
+    return M
+
+
+def etf_overcomplete(num_vectors: int, dim: int, seed: int = 0) -> torch.Tensor:
+    """
+    For the overcomplete case (num_vectors > dim + 1), we can't build a perfect
+    simplex ETF. Instead, build a block-composed approximation:
+    
+    Partition num_vectors into ceil(num_vectors / dim) blocks of size <= dim+1,
+    build a perfect simplex ETF for each block, and stack them. Then apply a
+    shared fixed orthogonal rotation so blocks don't align with coordinate axes.
+    
+    This gives exact equiangularity within each block and near-uniform separation
+    across blocks via the rotation.
+    
+    Returns: (num_vectors, dim) tensor of unit-norm vectors.
+    """
+    if num_vectors <= dim + 1:
+        return simplex_etf(num_vectors, dim)
+
+    # block size: at most dim+1 vectors per perfect ETF (requires dim dims)
+    block_size = dim + 1
+    blocks = []
+    remaining = num_vectors
+    while remaining > 0:
+        k = min(block_size, remaining)
+        if k == 1:
+            # single vector: just pick a unit vector
+            v = torch.zeros(1, dim)
+            v[0, 0] = 1.0
+            blocks.append(v)
+        else:
+            blocks.append(simplex_etf(k, dim))
+        remaining -= k
+
+    M = torch.cat(blocks, dim=0)  # (num_vectors, dim)
+
+    # apply a deterministic orthogonal rotation so the block structure
+    # doesn't create axis-aligned clusters
+    gen = torch.Generator().manual_seed(seed)
+    Q = torch.linalg.qr(torch.randn(dim, dim, generator=gen))[0]  # random orthogonal
+    M = M @ Q
+
+    # renormalize (should already be ~unit but numerical safety)
+    M = M / M.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return M
+
+
+def init_contextual_embed_etf(model, seed: int = 42):
+    """
+    Replace the random Gaussian buffers in a ContextualEmbed module
+    with ETF-structured projections.
+    
+    Modifies model in-place. Call after constructing the model.
+    
+    Buffers replaced:
+        edge_A:        (vocab_size, edge_proj_dim)
+        edge_B:        (vocab_size, edge_proj_dim)
+        path_dirs:     (path_levels, vocab_size, path_dim)
+        direction_proj: (fp_width, embed_dim)
+    """
+    V = model.vocab_size
+    edge_dim = model.edge_proj_dim
+    path_dim = model.path_dim
+    path_levels = model.path_levels
+    embed_dim = model.embed_dim
+    fp_width = model.fp_width
+
+    # --- edge_A and edge_B: each maps V tokens into R^edge_proj_dim ---
+    # These are combined multiplicatively (A[prev] * B[cur]), so we want
+    # A and B to each be ETF-structured but with different rotations,
+    # so the element-wise product of any (A[i], B[j]) pair is distinct.
+    edge_A = etf_overcomplete(V, edge_dim, seed=seed)
+    edge_B = etf_overcomplete(V, edge_dim, seed=seed + 1)
+    # Scale to match original 1/sqrt(edge_proj_dim) magnitude
+    edge_A = edge_A / math.sqrt(edge_dim)
+    edge_B = edge_B / math.sqrt(edge_dim)
+    model.edge_A.copy_(edge_A)
+    model.edge_B.copy_(edge_B)
+
+    # --- path_dirs: (path_levels, V, path_dim) ---
+    # Each level gets its own ETF with a different rotation seed
+    for lv in range(path_levels):
+        dirs = etf_overcomplete(V, path_dim, seed=seed + 100 + lv)
+        dirs = dirs / math.sqrt(path_dim)
+        model.path_dirs[lv].copy_(dirs)
+
+    # --- direction_proj: (fp_width, embed_dim) ---
+    # This is the final projection from fingerprint space to embedding space.
+    # fp_width is typically >> embed_dim, so we build an ETF over fp_width
+    # vectors in R^embed_dim. This maximally separates what each fingerprint
+    # dimension contributes to the output.
+    proj = etf_overcomplete(fp_width, embed_dim, seed=seed + 999)
+    proj = proj / math.sqrt(fp_width)
+    model.direction_proj.copy_(proj)
+
+    return model
+
+
+# --- Usage ---
+# from contextual_embed import ContextualEmbed
+# model = ContextualEmbed(vocab_size=50257, embed_dim=768)
+# init_contextual_embed_etf(model)
+
 class ContextualEmbed(nn.Module):
     def __init__(
         self,
@@ -148,7 +288,7 @@ class ContextualEmbed(nn.Module):
 
 
     def forward(self, token_ids):
-        fingerprints, magnitudes = self.encode(token_ids)
+        fingerprints = self.encode(token_ids)
         raw_direction = fingerprints @ self.direction_proj
 
         # normalize to unit direction (the ray)
