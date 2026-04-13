@@ -1002,8 +1002,10 @@ class ContextCone(nn.Module):
 
         # projection from fingerprint space to embedding space
         # this IS learned, but initialized small
-        self.direction_proj = nn.Linear(self.fp_width, embed_dim, bias=False)
-        nn.init.normal_(self.direction_proj.weight, std=0.005)
+        rng_proj = torch.Generator().manual_seed(seed + 999)
+        proj_matrix = torch.randn(self.fp_width, embed_dim, generator=rng_proj)
+        proj_matrix = proj_matrix / math.sqrt(self.fp_width)
+        self.register_buffer('direction_proj', proj_matrix)
 
     @torch.compiler.disable
     def encode(self, token_ids):
@@ -1101,7 +1103,7 @@ class ContextCone(nn.Module):
             warped: (B, T, D) context-warped target embeddings
         """
         # project fingerprint to a direction in embedding space
-        raw_direction = self.direction_proj(fingerprints)  # (B, T, D)
+        raw_direction = fingerprints @ self.direction_proj
 
         # normalize to unit direction (the ray)
         direction = F.normalize(raw_direction, dim=-1, eps=1e-8)
@@ -1112,7 +1114,7 @@ class ContextCone(nn.Module):
         tangent_direction = F.normalize(direction - parallel, dim=-1, eps=1e-8)
 
         # walk along the tangent direction, magnitude scales with context length
-        displacement = tangent_direction * magnitudes.unsqueeze(-1)
+        displacement = tangent_direction #* magnitudes.unsqueeze(-1)
 
         # apply displacement and renormalize to preserve original norm
         warped = target_embeds + displacement
@@ -1197,15 +1199,35 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         b, T = idx.size()
         x = self.transformer.wte(idx)
+        x = self.warp(idx,x)
         for i, block in enumerate(self.transformer.h):
             x= block(x)
 
         x = norm(x)
 
-        x = self.warp(idx, x)
+        fingerprints, magnitudes = self.warp.encode(idx)
+
         if targets is not None:
-            logits, aux_loss = self.lm_head(x)
-            loss = self.criterion(logits, targets) + 0.01 * aux_loss
+          
+          # h_next is the model's own representation of the target positions
+          # x is (B, T, D) after all layers and norm
+          # x[:, 1:] is h at positions 1..T-1, which are the targets for positions 0..T-2
+          h_current = x[:, :-1]  # (B, T-1, D)
+          h_next = x[:, 1:].detach()  # (B, T-1, D) -- detach so we don't backprop through target
+          
+          fp = fingerprints[:, :-1]  # context at positions 0..T-2
+          mag = magnitudes[:, :-1]
+          
+          warped_next = self.warp.warp(fp, mag, h_next)
+          
+          h_norm = F.normalize(h_current, dim=-1)
+          cos_warped = (h_norm * F.normalize(warped_next, dim=-1)).sum(dim=-1)
+          cos_unwarped = (h_norm * F.normalize(h_next, dim=-1)).sum(dim=-1)
+          
+          specificity_loss = F.relu(cos_unwarped - cos_warped).mean()
+          
+          logits, aux_loss = self.lm_head(x)
+          loss = self.criterion(logits, targets) +  aux_loss + specificity_loss
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
