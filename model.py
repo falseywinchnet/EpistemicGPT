@@ -193,11 +193,11 @@ class Attention(nn.Module):
         self.head_dim = dim // self.n_heads
 
 
-        self.q_proj = MLP(dim,dim)
+        self.q_proj = MLP(config)
         self.k_proj = nn.Linear(dim, dim, bias=config.bias)
         self.v_proj = nn.Linear(dim, dim, bias=config.bias)
 
-        self.p_mlp = MLP(dim,dim)
+        self.p_mlp = MLP(config)
         self.o_proj = nn.Linear(dim, dim, bias=config.bias)
         self.s_proj = nn.Linear(dim, dim, bias=config.bias)
 
