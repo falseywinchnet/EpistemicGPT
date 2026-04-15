@@ -204,6 +204,8 @@ class Attention(nn.Module):
 
         self.q_proj = MLP(config)
         self.k_proj = nn.Linear(dim, dim, bias=config.bias)
+        self.s_proj = nn.Linear(dim, dim, bias=config.bias)
+
         self.v_proj = nn.Linear(dim, dim, bias=config.bias)
 
         self.p_proj = nn.Linear(dim, dim, bias=config.bias)
@@ -213,12 +215,11 @@ class Attention(nn.Module):
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
-        self.alpha = 2.0 * math.log(2.0)
 
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
-
+        s = self.s_proj(x).view(B, T, H, D).transpose(1, 2)
         k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
@@ -239,7 +240,7 @@ class Attention(nn.Module):
         # Softplus magnitude path with sink
         null_col = torch.ones(1, 1, T, 1, device=x.device).expand(B, H, -1, -1)
         mask_use = torch.cat([mask, null_col], dim=-1)
-        soft_scores = F.softplus(self.alpha * scores)
+        soft_scores = F.softplus(scores)
         threshold = 1e-6
         pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
         soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
@@ -253,7 +254,7 @@ class Attention(nn.Module):
         # Two mixtures
         y = attn[:, :, :, :T] @ v
         modulated = attn[:, :, :, :T] * resp  # zero out magnitude where resp says nothing is responsible
-        y_resp = modulated @ k
+        y_resp = modulated @ s
 
         # XSA , then project
         vn = F.normalize(v, dim=-1)
@@ -315,7 +316,6 @@ class SoftplusCELoss(nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
         self.label_smoothing = label_smoothing
-        self.alpha = 2.0 * math.log(2.0) #emulates softmax
 
     def forward(self, logits, targets):
         # logits: (B, V) or (B, T, V)
@@ -330,7 +330,7 @@ class SoftplusCELoss(nn.Module):
         if flat_targets.numel() == 0:
             return flat_logits.sum() * 0.0
 
-        sp = F.softplus(self.alpha* flat_logits)
+        sp = F.softplus(flat_logits)
 
         threshold = 1e-6
         pruned = torch.where(sp < threshold, torch.zeros_like(sp), sp)
@@ -976,7 +976,7 @@ class GPT(nn.Module):
         return n_params
     def forward(self, idx, targets=None):
         b, T = idx.size()
-        x = self.transformer.wte(idx)
+        x = self.transformer.wte(idx) + self.hash(idx)
         for i, block in enumerate(self.transformer.h):
             x= block(x)
 
