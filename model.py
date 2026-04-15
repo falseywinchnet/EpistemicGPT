@@ -697,6 +697,130 @@ class ContextCone(nn.Module):
         return self.warp(fingerprints)
 
 
+
+class ContinuousContextCone(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        edge_proj_dim: int = 128,
+        path_dim: int = 64,
+        path_levels: int = 5,
+        content_proj_dim: int = 256,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.edge_proj_dim = edge_proj_dim
+        self.path_dim = path_dim
+        self.path_levels = path_levels
+        self.content_proj_dim = content_proj_dim
+
+        rng = torch.Generator().manual_seed(seed)
+
+        # content: project embeddings to a fixed-dim space before accumulating
+        # this replaces the one-hot histogram with a projected-sum histogram
+        self.register_buffer(
+            'content_proj',
+            torch.randn(embed_dim, content_proj_dim, generator=rng)
+            / math.sqrt(embed_dim)
+        )
+
+        # edges: two independent random projections for prev/cur
+        # their elementwise product is the transition signature
+        self.register_buffer(
+            'edge_proj_A',
+            torch.randn(embed_dim, edge_proj_dim, generator=rng)
+            / math.sqrt(embed_dim)
+        )
+        self.register_buffer(
+            'edge_proj_B',
+            torch.randn(embed_dim, edge_proj_dim, generator=rng)
+            / math.sqrt(embed_dim)
+        )
+
+        # paths: one random projection per level, from embed_dim to path_dim
+        # replaces path_dirs[lv][tok] lookup
+        path_projs = torch.randn(
+            path_levels, embed_dim, path_dim, generator=rng
+        ) / math.sqrt(embed_dim)
+        self.register_buffer('path_projs', path_projs)
+
+        # same golden-ratio positional phases
+        phases = torch.zeros(path_levels, 1024)
+        for lv in range(path_levels):
+            for p in range(1024):
+                phases[lv, p] = math.cos(
+                    (p + 1) * (lv + 1) * 2.3999632297286533
+                )
+        self.register_buffer('pos_phases', phases)
+
+        # total fingerprint width
+        self.fp_width = content_proj_dim + edge_proj_dim + path_dim * path_levels
+
+        # final projection to embedding space
+        rng_out = torch.Generator().manual_seed(seed + 999)
+        proj_matrix = torch.randn(self.fp_width, embed_dim, generator=rng_out)
+        proj_matrix = proj_matrix / math.sqrt(self.fp_width)
+        self.register_buffer('direction_proj', proj_matrix)
+
+    @torch.compiler.disable
+    def encode(self, embeddings):
+        """
+        embeddings: (B, T, D) continuous embedding vectors
+
+        Returns:
+            fingerprints: (B, T, fp_width)
+        """
+        B, T, D = embeddings.shape
+        device = embeddings.device
+
+        # === Content: cumulative projected sum ===
+        # replaces one-hot histogram with projected-embedding accumulation
+        projected = embeddings @ self.content_proj  # (B, T, content_proj_dim)
+        content = projected.cumsum(dim=1)
+
+        # === Edges: elementwise product of projected consecutive pairs ===
+        edges = torch.zeros(B, T, self.edge_proj_dim, device=device)
+        if T > 1:
+            prev_proj = embeddings[:, :-1] @ self.edge_proj_A  # (B, T-1, edge_proj_dim)
+            cur_proj = embeddings[:, 1:] @ self.edge_proj_B
+            edge_vecs = prev_proj * cur_proj
+            edges[:, 1:] = edge_vecs.cumsum(dim=1)
+
+        # === Paths: continuous n-gram projections ===
+        path_parts = []
+        for lv in range(self.path_levels):
+            n = lv + 1
+            accum = torch.zeros(B, T, self.path_dim, device=device)
+
+            if T >= n:
+                # project all embeddings through this level's random matrix
+                # replaces path_dirs[lv][tok] lookup
+                level_proj = embeddings @ self.path_projs[lv]  # (B, T, path_dim)
+
+                for offset in range(n):
+                    start_idx = offset
+                    end_idx = T - n + 1 + offset
+                    if end_idx <= start_idx:
+                        continue
+                    dirs = level_proj[:, start_idx:end_idx]  # (B, T-n+1, path_dim)
+                    phase = self.pos_phases[lv, offset]
+                    accum[:, (n-1):T, :] += dirs[:, :(T-n+1), :] * phase
+
+                accum = accum.cumsum(dim=1)
+
+            path_parts.append(accum)
+
+        path = torch.cat(path_parts, dim=-1)
+        fingerprints = torch.cat([content, edges, path], dim=-1)
+        return fingerprints
+
+    def warp(self, fingerprints):
+        return fingerprints @ self.direction_proj
+
+    def forward(self, embeddings):
+        return self.warp(self.encode(embeddings))
+
 import math
 from dataclasses import dataclass
 
