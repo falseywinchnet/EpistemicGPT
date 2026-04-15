@@ -923,7 +923,7 @@ class GPT(nn.Module):
           block.attn.mask = self.mask #set here
           block.attn.depth= i
           i = i + 1
-        self.hash=ContextCone(config.vocab_size,config.n_embd),
+        self.hash=ContextCone(config.vocab_size,config.n_embd)
         self._boundary_handles = []
         self.register_confined_backward()
         self.criterion = SoftplusCELoss(ignore_index=-1)
