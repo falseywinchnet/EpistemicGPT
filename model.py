@@ -202,16 +202,15 @@ class Attention(nn.Module):
         self.head_dim = dim // self.n_heads
 
 
-        self.q_proj = MLP(config)
+        self.q_proj = nn.Linear(dim, dim, bias=config.bias)
         self.k_proj = nn.Linear(dim, dim, bias=config.bias)
-        self.s_proj = nn.Linear(dim, dim, bias=config.bias)
-
         self.v_proj = nn.Linear(dim, dim, bias=config.bias)
-
         self.p_proj = nn.Linear(dim, dim, bias=config.bias)
+        self.o_proj = nn.Linear(dim, dim, bias=config.bias)
 
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.sink_key = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
+        self.sink_value = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
 
         self.mask = None #set in GPT main at model time to ensure its on GPU
         self.rope = config.rope
@@ -219,7 +218,6 @@ class Attention(nn.Module):
     def forward(self, x):
         B, T, C = x.shape
         H, D = self.n_heads, self.head_dim
-        s = self.s_proj(x).view(B, T, H, D).transpose(1, 2)
         k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
@@ -230,13 +228,12 @@ class Attention(nn.Module):
 
         mask = self.mask[:, :, :T, :T].expand(B, H, -1, -1)
        
-        scores_real = (q @ k.transpose(-2, -1)) * (math.log(T+1) * math.log(D))
-        sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) * (math.log(T+1) * math.log(D))
+        scores_real = (q @ k.transpose(-2, -1)) * (math.log(T) * math.log(D))
+        sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) * (1 * math.log(D))
         scores = torch.cat([scores_real, sink_scores], dim=-1)
-
-        # Responsibility posterior: no sink, proper distribution
-        resp = F.softmax(scores_real.masked_fill(mask == 0, float('-inf')), dim=-1)
-
+        
+        
+       
         # Softplus magnitude path with sink
         null_col = torch.ones(1, 1, T, 1, device=x.device).expand(B, H, -1, -1)
         mask_use = torch.cat([mask, null_col], dim=-1)
@@ -245,33 +242,44 @@ class Attention(nn.Module):
         pruned_scores = torch.where(soft_scores < threshold, torch.zeros_like(soft_scores), soft_scores)
         soft_scores = soft_scores + (pruned_scores - soft_scores).detach()
         soft_scores = soft_scores.masked_fill(mask_use == 0, 0.0)
-
         soft_sums = soft_scores.sum(dim=-1, keepdim=True)
         scale = torch.clamp(1.0 / (soft_sums + 1e-6), max=1.0)
+        m = mask_use.float()
+        mass = (m * F.softplus(scores)).sum(dim=-1, keepdim=True) + 1e-6
+    
+        # stage 1
+        d = (m * torch.sigmoid(scores)) / mass          # (B,H,T,T+1)
+    
+        # stage 2
+        R = d.sum(dim=-2)                               # (B,H,T+1)
+    
+        # stage 3
+        lam_geom_raw = F.softplus(R)
+        lam_geom = lam_geom_raw / (lam_geom_raw.sum(dim=-1, keepdim=True) + 1e-6)
+        responsibility = lam_geom.unsqueeze(-2) - lam_geom.mean(dim=-1, keepdim=True).unsqueeze(-2)       
+        
         attn = soft_scores * scale
         attn = torch.nan_to_num(attn, nan=0.0)
+        attn_real = attn[:, :, :, :T]
+        attn_sinks= attn[:, :, :, T:]
+        attn_resp_real =  attn[:, :, :, :T] * responsibility[:, :, :, :T]
+        
+        y = attn_real @ v + attn_sinks * self.sink_value
+        y_resp = attn_resp_real @ v
 
-        # Two mixtures
-        y = attn[:, :, :, :T] @ v
-        modulated = attn[:, :, :, :T] * resp  # zero out magnitude where resp says nothing is responsible
-        y_resp = modulated @ s
 
         # XSA , then project
         vn = F.normalize(v, dim=-1)
-        y_x = y - (y * vn).sum(dim=-1, keepdim=True) * vn
+        y_context = y - (y * vn).sum(dim=-1, keepdim=True) * vn
+        y_resp_context = y_resp - (y_resp * vn).sum(dim=-1, keepdim=True) * vn
 
+        y_context = y_context + y_resp_context
+
+        y_context = F.rms_norm(y_context, (D,)) + self.v_sink_basis
+        y_context_flat = y_context.transpose(1, 2).contiguous().view(B, T, -1)
+        truth = self.o_proj(y_context_flat)
+       
         
-        r = F.normalize(y_resp, dim=-1)
-        y_resp = (y_resp * r).sum(dim=-1, keepdim=True) * r
-
-        y_context = y_x + y_resp
-
-        y_along = y_context  # the resp-supported component, already computed
-        y_along = F.rms_norm(y_along, (D,)) + self.v_sink_basis
-        y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
-
-
-        truth = self.p_proj(y_along_flat)
         return truth
 
 def norm(x):
@@ -925,7 +933,7 @@ class GPT(nn.Module):
           i = i + 1
         self.hash=ContextCone(config.vocab_size,config.n_embd)
         self._boundary_handles = []
-        self.register_confined_backward()
+        #self.register_confined_backward()
         self.criterion = SoftplusCELoss(ignore_index=-1)
         self.lm_head = ParallelSubspaceUnembed(config.n_embd, config.vocab_size)
         self.time_head = ParallelSubspaceUnembed(config.n_embd, config.n_embd)
@@ -976,7 +984,7 @@ class GPT(nn.Module):
         return n_params
     def forward(self, idx, targets=None):
         b, T = idx.size()
-        x = self.transformer.wte(idx) + self.hash(idx)
+        x = self.transformer.wte(idx) 
         for i, block in enumerate(self.transformer.h):
             x= block(x)
 
