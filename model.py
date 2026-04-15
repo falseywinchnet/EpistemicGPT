@@ -287,7 +287,6 @@ class Attention(nn.Module):
 
 
         truth = self.p_mlp(y_along_flat) + self.o_proj(y_ortho_flat) + self.s_proj(poynting)
-        return truth
         if self.training:
             mod_mask = self.erode(B, H, T, x.device)
 
