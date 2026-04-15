@@ -250,7 +250,7 @@ class Attention(nn.Module):
         q = self.rope(q)
         k = self.rope(k)
 
-        mask = self.mask[:, :, :T, :T]
+        mask = self.mask[:, :, :T, :T].expand(B, H, -1, -1)
 
         scores_real = (q @ k.transpose(-2, -1)) * (math.log(T+1) * math.log(D))
         sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) * (math.log(T+1) * math.log(D))
@@ -260,7 +260,7 @@ class Attention(nn.Module):
         resp = F.softmax(scores_real.masked_fill(mask == 0, float('-inf')), dim=-1)
 
         # Softplus magnitude path with sink
-        null_col = torch.ones(1, 1, T, 1, device=x.device)
+        null_col = torch.ones(1, 1, T, 1, device=x.device).expand(B, H, -1, -1)
         mask_use = torch.cat([mask, null_col], dim=-1)
         soft_scores = F.softplus(self.alpha * scores)
         threshold = 1e-6
@@ -306,6 +306,7 @@ class Attention(nn.Module):
 
         if self.training:
             mod_mask = self.erode(B, H, T, x.device)
+
             eroded_mask = mask.masked_fill(mod_mask == 0, 0.0)
             eroded_mask_use = torch.cat([eroded_mask, null_col], dim=-1)
 
