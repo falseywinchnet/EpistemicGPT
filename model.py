@@ -256,8 +256,6 @@ class Attention(nn.Module):
         sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) * (math.log(T+1) * math.log(D))
         scores = torch.cat([scores_real, sink_scores], dim=-1)
 
-        # Responsibility posterior: no sink, proper distribution
-        resp = F.softmax(scores_real.masked_fill(mask == 0, float('-inf')), dim=-1)
 
         # Softplus magnitude path with sink
         null_col = torch.ones(1, 1, T, 1, device=x.device).expand(B, H, -1, -1)
@@ -273,27 +271,14 @@ class Attention(nn.Module):
         attn = soft_scores * scale
         attn = torch.nan_to_num(attn, nan=0.0)
 
-        # Two mixtures
         y = attn[:, :, :, :T] @ v
-        y_resp = resp @ v
 
-        # XSA on both, then project
         vn = F.normalize(v, dim=-1)
         y_x = y - (y * vn).sum(dim=-1, keepdim=True) * vn
-        y_resp = y_resp - (y_resp * vn).sum(dim=-1, keepdim=True) * vn
 
-        #correct for mirror descent
-        rn = F.normalize(y_resp, dim=-1)
-        y_context = (y_x * rn).sum(dim=-1, keepdim=True) * rn
 
-        # === O/P decomposition along mixing tensor eigenvectors ===
-        # Decompose y into component along mix_dir and component orthogonal to it
-        # mix_dir is the dominant eigenvector of the mixing stress
-        # rn is already computed: F.normalize(y_resp_xsa, dim=-1)
-        # y_context is already the projection onto rn
-
-        y_along = y_context  # the resp-supported component, already computed
-        y_ortho = y - y_along  # what resp doesn't support
+        y_along = y_x  
+        y_ortho = y - y_along  
         y_along = F.rms_norm(y_along, (D,)) + self.v_sink_basis
         y_ortho = F.rms_norm(y_ortho, (D,))
         y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
@@ -302,8 +287,7 @@ class Attention(nn.Module):
 
 
         truth = self.p_mlp(y_along_flat) + self.o_proj(y_ortho_flat) + self.s_proj(poynting)
-
-
+        return truth
         if self.training:
             mod_mask = self.erode(B, H, T, x.device)
 
@@ -321,10 +305,9 @@ class Attention(nn.Module):
   
             y_e = e_attn[:, :, :, :T] @ v
             y_x = y_e - (y_e * vn).sum(dim=-1, keepdim=True) * vn
-            y_e_ctx = (y_x * rn).sum(dim=-1, keepdim=True) * rn
 
-            y_along_raw = y_e_ctx
-            y_ortho_raw = y_e - y_e_ctx
+            y_along_raw = y_x
+            y_ortho_raw = y_e - y_x
             y_along = F.rms_norm(y_along_raw, (D,)) + self.v_sink_basis
             y_ortho = F.rms_norm(y_ortho_raw, (D,))
             y_along_flat = y_along.transpose(1, 2).contiguous().view(B, T, -1)
@@ -332,7 +315,6 @@ class Attention(nn.Module):
             poynting = y_along_flat * y_ortho_flat
             tangent = self.p_mlp(y_along_flat) + self.o_proj(y_ortho_flat) + self.s_proj(poynting)
             truth = tangent + (truth - tangent).detach()
-
         return truth
 
 def norm(x):
