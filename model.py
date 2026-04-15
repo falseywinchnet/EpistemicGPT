@@ -911,6 +911,132 @@ class ThreePieceEmbedding(nn.Module):
         return base
 
 
+import torch
+import torch.nn.functional as F
+
+def expected_rank_of_token(scores: torch.Tensor,
+                           token_ids: torch.Tensor,
+                           temperature: float = 1.0) -> torch.Tensor:
+    """
+    Computes the expected rank of the given token at each position, without full V x V matrix.
+    """
+    # scores: (..., V), token_ids: (...,)
+
+    # Gather score of the target token
+    score_i = scores.gather(-1, token_ids.unsqueeze(-1))  # (..., 1)
+
+    # Δ_j = score_j - score_i
+    diff = scores - score_i  # (..., V)
+
+    # P(j beats i)
+    p = torch.sigmoid(diff / temperature)
+
+    # Expected rank = 1 + sum_j P(j > i)
+    return 1.0 + p.sum(dim=-1)  # (...,)
+
+
+def rank_future_sequence_loss_soft(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    max_future_steps: int = 15,
+    decay: float = 0.5,
+    temperature: float = 1.0,
+    reduction: str = "mean",
+):
+    """
+    Memory-efficient smooth rank loss. For each t, matches rank of x_{t+Δ} to Δ.
+    logits  … (B, T, V) – model scores
+    targets … (B, T)    – token ids
+    """
+    B, T, V = logits.shape
+    device = logits.device
+    total_loss = torch.tensor(0.0, device=device)
+
+    for Δ in range(2, max_future_steps + 1):
+        if Δ >= T:
+            break
+
+        # Current time-step logits (for rank eval)
+        cur_logits  = logits[:, :-Δ, :]          # (B, T−Δ, V)
+        fut_targets = targets[:, Δ:]             # (B, T−Δ)
+
+        # Efficient rank of ground-truth future token
+        tgt_exp_rank = expected_rank_of_token(cur_logits, fut_targets, temperature)  # (B, T−Δ)
+
+        # Penalize distance from desired rank Δ
+        step_loss = F.l1_loss(
+            tgt_exp_rank,
+            torch.full_like(tgt_exp_rank, float(Δ)),
+            reduction=reduction
+        )
+
+        # Apply decay for further future steps
+        total_loss = total_loss + step_loss * (decay ** (Δ - 1))
+
+    return total_loss
+
+def ordered_future_loss(logits: torch.Tensor,
+                        targets: torch.Tensor,
+                        N: int = 15,
+                        decay: float = 0.7,
+                        tau: float = 1.0,
+                        reduction: str = "mean"):
+    """
+    Penalise when the logits at step t do *not* respect the order of the next N tokens.
+
+        top-1 logit should match token t+1
+        top-2 logit should match token t+2
+        ...
+        top-N logit should match token t+N
+
+    logits  – (B, T, V)
+    targets – (B, T)
+    """
+    B, T, V = logits.shape
+    device  = logits.device
+
+    if N < 2:
+        return torch.tensor(0., device=device)
+
+    # windows where t+N fits in sequence
+    valid_T = T - (N + 1)
+    if valid_T <= 0:
+        return torch.tensor(0., device=device)
+
+    # (B, valid_T, N) → future token ids for each offset 2..N
+    future_ids = torch.stack([targets[:, 2+k : 2+k+valid_T] for k in range(N)],
+                         dim=-1)
+
+    # (B, valid_T, N) → gather logits of those future tokens *now* (at step t)
+    step_logits = logits[:, :valid_T, :].gather(
+        -1, future_ids)                       # logit(x_{t+k})
+
+    # pair-wise differences  Δ_{k,j} = logit_k − logit_j, shape (B, valid_T, N, N)
+    diff = step_logits.unsqueeze(-1) - step_logits.unsqueeze(-2)
+
+    # upper-triangular mask k<j (ignore diag & lower triangle)
+    k_lt_j = torch.triu(torch.ones(N, N, device=device, dtype=torch.bool), 1)
+
+    # logistic ranking loss
+    pair_loss = F.softplus(-diff / tau)       # log(1+e^{-Δ/τ})
+    pair_loss = pair_loss[..., k_lt_j]        # keep k<j entries, now shape (B, valid_T, M)
+
+    # geometric weights per k (distance from current step)
+    k_idx = torch.arange(N, device=device)
+    weight = decay ** k_idx                   # shape (N,)
+    # broadcast to pair-wise (k<j) selector
+    weight_pair = weight.unsqueeze(-1).expand(N, N)[k_lt_j]  # (M,)
+
+    pair_loss = pair_loss * weight_pair       # (B, valid_T, M)
+
+    if reduction == "mean":
+        return pair_loss.mean()
+    elif reduction == "sum":
+        return pair_loss.sum()
+    else:                                     # 'none'
+        return pair_loss                      # (B, valid_T, M)
+#+ rank_future_sequence_loss_soft(logits,targets) * 1e-3 + ordered_future_loss(logits,targets) * 1e-3
+
 class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
