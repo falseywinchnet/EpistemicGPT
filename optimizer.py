@@ -268,6 +268,8 @@ class CardHouse(Optimizer):
 
     def _activation_hook(self, module: nn.Module, input, output):
         """Capture input activations for a linear layer."""
+        if not module.training:
+          return
         x = input[0]
         if x.dim() == 3:
             # (batch, seq, dim) -> flatten to (batch*seq, dim)
