@@ -1,0 +1,42 @@
+name: Move PDFs
+
+on: [workflow_dispatch]
+
+jobs:
+  move-pdfs:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Move PDF files
+      run: |
+        cd $GITHUB_WORKSPACE
+        git mv 1002.0373v3.pdf papers/ || true
+        git mv "2004.01902v2 (1).pdf" papers/ || true
+        git mv "2008.03936v1 (2).pdf" papers/ || true
+        git mv 2307.11372v3.pdf papers/ || true
+        git mv 2312.04827v3.pdf papers/ || true
+        git mv 2501.13428v4.pdf papers/ || true
+        git mv 2505.16381v2.pdf papers/ || true
+        git mv 2602.02385v1.pdf papers/ || true
+        git mv 2602.02422v1.pdf papers/ || true
+        git mv 2602.04078v1.pdf papers/ || true
+        git mv 2602.23946v1.pdf papers/ || true
+        git mv 2603.09078v1.pdf papers/ || true
+        git mv 2603.10090v1.pdf papers/ || true
+        git mv 2604.03170v1.pdf papers/ || true
+        git mv 2604.04891v1.pdf papers/ || true
+        git mv 2604.07023v1.pdf papers/ || true
+        git mv 2604.09784v2.pdf papers/ || true
+        git mv 2604.10848v1.pdf papers/ || true
+        git mv 2604.11912v1.pdf papers/ || true
+        git mv Attention_Residuals.pdf papers/ || true
+        git mv LLM_KNOWLEDGE.pdf papers/ || true
+    
+    - name: Commit and push
+      run: |
+        git config user.name 'GitHub Action'
+        git config user.email 'action@github.com'
+        git commit -m 'Move all PDF files to papers directory' || echo "No changes to commit"
+        git push origin main
