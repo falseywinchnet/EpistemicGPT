@@ -208,7 +208,7 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(dim, dim, bias=config.bias)
         self.v_proj = nn.Linear(dim, dim, bias=config.bias)
         self.p_proj = nn.Linear(dim, dim, bias=config.bias)
-        self.o_proj = nn.Linear(dim, dim, bias=config.bias)
+        self.o_proj = nn.Linear(dim, dim*2, bias=config.bias)
 
         self.v_sink_basis = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
         self.sink_key = nn.Parameter(torch.zeros(1, self.n_heads, 1, self.head_dim))
@@ -226,14 +226,18 @@ class Attention(nn.Module):
 
         q = F.rms_norm(q, (D,), eps=1e-6) #never norm K. Ever. 
         q = self.rope(q)
-        k_normed = F.rms_norm(k, (D,), eps=1e-6)
+        
+        if self.training: 
+            k_normed = F.rms_norm(k, (D,), eps=1e-6)
+            k_normed = self.rope(k_normed)
+            scores_hoped = (q @ k_normed.transpose(-2, -1)) * (1.08/ math.sqrt(D))
 
         k = self.rope(k)
-        k_normed = self.rope(k_normed)
 
         scores_real = (q @ k.transpose(-2, -1)) *( 1.08/ math.sqrt(D)) #formally correct and tested
-        scores_hoped = (q @ k_normed.transpose(-2, -1)) * (1.08/ math.sqrt(D))
-        scores = scores_hoped +( scores_real - scores_hoped).detach()
+        if self.training: 
+            scores = scores_hoped +( scores_real - scores_hoped).detach()
+            
         sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) *( 1.08/ math.sqrt(D))
         scores = torch.cat([scores_real, sink_scores], dim=-1)
         
@@ -284,9 +288,9 @@ class Attention(nn.Module):
         y_context = F.rms_norm(y_context, (D,)) + self.v_sink_basis
         y_context_flat = y_context.transpose(1, 2).contiguous().view(B, T, -1)
         truth = self.o_proj(y_context_flat)
-       
+        result =  torch.matmul(truth[:,:,:C], self.k_proj.weight.T) +  torch.matmul(truth[:,:,C:], self.q_proj.weight.T)
         
-        return truth
+        return result
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),),eps=1e-6)
