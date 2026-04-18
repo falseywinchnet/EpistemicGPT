@@ -192,6 +192,8 @@ class MLP_bottle(nn.Module):
 
 
 
+
+
 class Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -228,8 +230,8 @@ class Attention(nn.Module):
 
         mask = self.mask[:, :, :T, :T].expand(B, H, -1, -1)
        
-        scores_real = (q @ k.transpose(-2, -1)) * (math.log(T) * math.log(D))
-        sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) * (1 * math.log(D))
+        scores_real = (q @ k.transpose(-2, -1)) *( 1.08/ math.sqrt(D)) #formally correct and tested- LSSA can go fuck themselves
+        sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) *( 1.08/ math.sqrt(D))
         scores = torch.cat([scores_real, sink_scores], dim=-1)
         
         
