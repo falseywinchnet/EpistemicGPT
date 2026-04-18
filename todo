@@ -1,0 +1,6 @@
+Two model ideas. 
+
+1: use cumsum or cone method to generate synthetic q OR synthetic k but not both, and use a linear to translate the other one to make more heads
+
+2: reuse V, K in a recursive process that rebuilds Q with a different linear from the one used for the final product. Alternatively- rebuild Q, V, keep K. Alternatively- rebuild Q,K, keep V.
+Alternatively- 
