@@ -226,8 +226,9 @@ class Attention(nn.Module):
 
         q = F.rms_norm(q, (D,), eps=1e-6) #never norm K. Ever. 
         q = self.rope(q)
+        k_normed = F.rms_norm(k, (D,), eps=1e-6)
+
         k = self.rope(k)
-        k_normed = F.rms_norm(k_normed, (D,), eps=1e-6)
         k_normed = self.rope(k_normed)
 
         scores_real = (q @ k.transpose(-2, -1)) *( 1.08/ math.sqrt(D)) #formally correct and tested
