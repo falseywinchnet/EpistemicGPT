@@ -227,15 +227,18 @@ class Attention(nn.Module):
         q = F.rms_norm(q, (D,), eps=1e-6) #never norm K. Ever. 
         q = self.rope(q)
         k = self.rope(k)
+        k_normed = F.rms_norm(k_normed, (D,), eps=1e-6)
+        k_normed = self.rope(k_normed)
 
-        mask = self.mask[:, :, :T, :T].expand(B, H, -1, -1)
-       
-        scores_real = (q @ k.transpose(-2, -1)) *( 1.08/ math.sqrt(D)) #formally correct and tested- LSSA can go fuck themselves
+        scores_real = (q @ k.transpose(-2, -1)) *( 1.08/ math.sqrt(D)) #formally correct and tested
+        scores_hoped = (q @ k_normed.transpose(-2, -1)) * (1.08/ math.sqrt(D))
+        scores = scores_hoped +( scores_real - scores_hoped).detach()
         sink_scores = (q @ self.sink_key.expand(B, -1, -1, -1).transpose(-2, -1)) *( 1.08/ math.sqrt(D))
         scores = torch.cat([scores_real, sink_scores], dim=-1)
         
         
-       
+        mask = self.mask[:, :, :T, :T].expand(B, H, -1, -1)
+
         # Softplus magnitude path with sink
         null_col = torch.ones(1, 1, T, 1, device=x.device).expand(B, H, -1, -1)
         mask_use = torch.cat([mask, null_col], dim=-1)
