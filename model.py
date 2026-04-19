@@ -217,6 +217,8 @@ def sharp_softplus(x):
     #tau could be 0, or it could be the center of the knob,  softplus(x) = ln(1+e^x) when ln(1+e^x) = (e^x + x)/2. Numerically that's around x ~ 0.4.
     but we're choosing a principled position- 
     1-ln(2) is about 1-1/e of the way into exponentiation territory. it represents a firm committment to the desire to suppress.
+
+    the goal here is to more aggressively push softplus to be selective inside attention, nothing more.
     """
     tau = 1-math.log(2)
     tau_t = torch.tensor(tau, device=x.device, dtype=x.dtype)
