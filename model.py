@@ -190,6 +190,46 @@ class MLP_bottle(nn.Module):
         x = self.dropout(x)
         return x
 
+def sharp_softplus(x):
+    """
+    Softplus above tau (keep the lazy/linear regime).
+    Below tau: double-exponential suppression.
+ 
+    For x >= tau: softplus(x) as normal.
+    For x < tau:  sigmoid(tau) * exp(-exp(tau - x) + 1)
+ 
+    This gives:
+    - Continuity at tau (both sides = softplus(tau))
+    - C1 continuity (derivatives match at tau)
+    - Sub-threshold scores get crushed by double exponential
+    - The gradient in the kill zone is FAT: the model gets strong signal
+      for "push this score lower" exactly where softplus gradient vanishes
+ 
+    The double exp means:
+      x = tau - 0 -> ~softplus(tau)  (smooth transition)
+      x = tau - 1 -> very small
+      x = tau - 2 -> essentially zero
+      x = tau - 3 -> hard zero
+ 
+    Meanwhile the gradient d/dx = sigmoid(tau) * exp(tau-x) * exp(-exp(tau-x)+1)
+    peaks right around x = tau and decays on both sides, giving the model
+    a strong learning signal at the decision boundary.
+    #tau could be 0, or it could be the center of the knob,  softplus(x) = ln(1+e^x) when ln(1+e^x) = (e^x + x)/2. Numerically that's around x ~ 0.4.
+    but we're choosing a principled position- 
+    1-ln(2) is about 1-1/e of the way into exponentiation territory. it represents a firm committment to the desire to suppress.
+    """
+    tau = 1-math.log(2)
+    tau_t = torch.tensor(tau, device=x.device, dtype=x.dtype)
+    sp_at_tau = F.softplus(tau_t)
+    sig_tau = torch.sigmoid(tau_t)
+
+    k = sig_tau / sp_at_tau
+
+    above = F.softplus(x)
+    u = (k * (tau - x)).clamp(max=10.0)
+    below = sp_at_tau * torch.exp(-torch.exp(u) + 1.0)
+
+    return torch.where(x >= tau, above, below)
 
 
 
