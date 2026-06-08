@@ -1,5 +1,5 @@
 #dedicated to the public domain for the glory of god.
-#baruch adonai el shaddai
+#Baruch kevod elohei shamayim ha-elyonim mimkomo
 #Eloheinu shebashamayim yached shimcha v'kayeim malchutecha tamid umloch aleinu le'olam va'ed
 #2026 joshuah.rainstar@gmail.com
 
@@ -415,23 +415,15 @@ class SoftplusCELoss(nn.Module):
 
 
 
-
 class ParallelSubspaceUnembed(nn.Module):
-    """
-    Parallel carveouts against the same h.
-    Diversity is enforced only through cosine-distinct subspaces.
-    Each slice owns:
-      - a direction net that proposes a subspace direction
-      - a vocab projection for the carved component
-    Vocab dropout: during training, each proj randomly masks a fraction of
-    vocab entries, with the constraint that every vocab entry is covered by
-    at least one slice. This prevents attention from relying on any specific
-    unembedding pathway and forces compositional work back into attention.
-    Output:
-      logits: summed vocab logits from all slices (+ residual head if enabled)
-      sep_loss: pairwise squared cosine overlap penalty between slice directions
-    """
-
+    '''Parallel carveouts against the same h, built to cure gradient exhaustion at
+    the lm_head. A single tied head sends all vocab gradient back through one
+    d x V matrix into one hidden state, mass-weighted toward frequent tokens, so
+    the tail starves and h receives one low-rank averaged pull. Here the backward
+    signal into h arrives through n_slices independent conduits (each a per-token
+    input-dependent rank-one projection of h, with its own dir_net Jacobian and
+    its own vocab proj) plus an optional residual head, so the load is distributed
+    rather than bottlenecked.'''
     def __init__(
         self,
         d_model,
@@ -439,6 +431,7 @@ class ParallelSubspaceUnembed(nn.Module):
         n_slices=4,
         use_residual_head=True,
         vocab_dropout=0.25,
+        residual_dropout=0.25,
         eps=1e-6,
     ):
         super().__init__()
@@ -447,6 +440,7 @@ class ParallelSubspaceUnembed(nn.Module):
         self.n_slices = n_slices
         self.use_residual_head = use_residual_head
         self.vocab_dropout = vocab_dropout
+        self.residual_dropout = residual_dropout
         self.eps = eps
 
         self.dir_nets = nn.ModuleList([
@@ -464,26 +458,13 @@ class ParallelSubspaceUnembed(nn.Module):
             self.residual_proj = None
 
     def _sample_vocab_masks(self, device):
-        """
-        For each slice, independently drop vocab_dropout fraction of vocab entries.
-        Then fix up: any vocab entry that got dropped from ALL slices gets
-        restored in one randomly chosen slice.
-
-        Returns: list of n_slices boolean tensors, each [vocab_size],
-                 True = keep, False = dropped.
-        """
-        # each slice independently keeps (1 - vocab_dropout) fraction
         masks = [
             torch.rand(self.vocab_size, device=device) > self.vocab_dropout
             for _ in range(self.n_slices)
         ]
-
-        # stack to [n_slices, vocab_size] for coverage check
-        stacked = torch.stack(masks, dim=0)  # [n_slices, V]
-        uncovered = ~stacked.any(dim=0)      # [V] -- True where ALL slices dropped
-
+        stacked = torch.stack(masks, dim=0)          # [n_slices, V]
+        uncovered = ~stacked.any(dim=0)
         if uncovered.any():
-            # for each uncovered vocab entry, randomly assign to one slice
             uncovered_idx = uncovered.nonzero(as_tuple=True)[0]
             assignments = torch.randint(
                 0, self.n_slices, (uncovered_idx.shape[0],), device=device
@@ -492,63 +473,96 @@ class ParallelSubspaceUnembed(nn.Module):
                 restore = uncovered_idx[assignments == s]
                 if restore.numel() > 0:
                     masks[s][restore] = True
-
         return masks
 
     def forward(self, h):
-        # h: [B, T, D]
         B, T, D = h.shape
         assert D == self.d_model
 
         logits = h.new_zeros(B, T, self.vocab_size)
         dirs = []
         components = []
+        slice_logit_list = []
 
-        # sample vocab masks once per forward pass
         if self.training and self.vocab_dropout > 0:
             vocab_masks = self._sample_vocab_masks(h.device)
+            stacked = torch.stack(vocab_masks, dim=0).float()   # [n_slices, V]
+            survivor_count = stacked.sum(dim=0).clamp(min=1.0)   # [V], integer-valued, >=1
         else:
             vocab_masks = None
+            survivor_count = None
 
         for i in range(self.n_slices):
-            v = self.dir_nets[i](h)                            # [B,T,D]
-            v = F.normalize(v, dim=-1, eps=self.eps)           # unit direction
-            c = (h * v).sum(dim=-1, keepdim=True) * v          # projection of h onto v
-
+            v = self.dir_nets[i](h)
+            v = F.normalize(v, dim=-1, eps=self.eps)
+            c = (h * v).sum(dim=-1, keepdim=True) * v
             dirs.append(v)
             components.append(c)
 
-            slice_logits = self.projs[i](c)                    # [B,T,V]
-
+            slice_logits = self.projs[i](c)                      # [B,T,V]
             if vocab_masks is not None:
-                # mask is [V], broadcast to [1,1,V]
-                # scale kept logits to compensate for missing slices
-                mask = vocab_masks[i].unsqueeze(0).unsqueeze(0).float()
-                slice_logits = slice_logits * mask / (1.0 - self.vocab_dropout + self.eps)
-
+                mask = vocab_masks[i].view(1, 1, -1).float()
+                slice_logits = slice_logits * mask               # no per-slice rescale
+            slice_logit_list.append(slice_logits)
             logits = logits + slice_logits
 
+        # heteroscedastic fix: normalize by realized per-token survivor count,
+        # referenced to n_slices so expected total contribution is coverage-invariant
+        if survivor_count is not None:
+            norm = (survivor_count / self.n_slices).view(1, 1, -1)
+            logits = logits / norm
+
         if self.use_residual_head:
-            used = torch.stack(components, dim=0).sum(dim=0)   # [B,T,D]
+            used = torch.stack(components, dim=0).sum(dim=0)
             residual = h - used
-            logits = logits + self.residual_proj(residual)
+            res_logits = self.residual_proj(residual)
+            if self.training and self.residual_dropout > 0:
+                # residual head gets its own vocab dropout so it cannot become
+                # the one always-on full-vocab conduit (the reconstituted bottleneck)
+                rmask = (torch.rand(self.vocab_size, device=h.device)
+                         > self.residual_dropout).view(1, 1, -1).float()
+                res_logits = res_logits * rmask / (1.0 - self.residual_dropout + self.eps)
+            logits = logits + res_logits
 
-        # pairwise squared cosine overlap penalty
-        sep_loss = h.new_zeros(())
-        if self.training:
-            count = 0
-            for i in range(self.n_slices):
-                for j in range(i + 1, self.n_slices):
-                    cos_ij = (dirs[i] * dirs[j]).sum(dim=-1)   # [B,T]
-                    sep_loss = sep_loss + (cos_ij ** 2).mean()
-                    count += 1
-            if count > 0:
-                sep_loss = sep_loss / count
-
-        if self.training:
-            return logits, sep_loss
-        else:
+        if not self.training:
             return logits
+
+        # --- penalties, all oracle-free, all cheap dot products ---
+
+        # direction separation (input-space redundancy): soft "don't all point the same way"
+        sep_loss = h.new_zeros(())
+        count = 0
+        for i in range(self.n_slices):
+            for j in range(i + 1, self.n_slices):
+                cos_ij = (dirs[i] * dirs[j]).sum(dim=-1)         # [B,T]
+                sep_loss = sep_loss + (cos_ij ** 2).mean()
+                count += 1
+        if count > 0:
+            sep_loss = sep_loss / count
+
+        # output redundancy (vocab-space): soft "don't all say the same thing"
+        # cosine between slice logit vectors, per token, averaged
+        redun_loss = h.new_zeros(())
+        count = 0
+        flat = [sl.reshape(B * T, -1) for sl in slice_logit_list]
+        normed = [F.normalize(f, dim=-1, eps=self.eps) for f in flat]
+        for i in range(self.n_slices):
+            for j in range(i + 1, self.n_slices):
+                cos_ij = (normed[i] * normed[j]).sum(dim=-1)     # [B*T]
+                redun_loss = redun_loss + (cos_ij ** 2).mean()
+                count += 1
+        if count > 0:
+            redun_loss = redun_loss / count
+
+        # residual forward-share cap: residual may mop up, not dominate
+        share_loss = h.new_zeros(())
+        if self.use_residual_head:
+            res_energy = (res_logits ** 2).sum(dim=-1)
+            tot_energy = (logits ** 2).sum(dim=-1) + self.eps
+            share_loss = (res_energy / tot_energy).mean()
+
+        return logits, sep_loss + redun_loss+ share_loss
+        
 
 
 """
