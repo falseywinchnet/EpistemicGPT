@@ -40,6 +40,458 @@ class LELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(self.scale * x)
 
+"""
+CylinderRoPE: exact circular rotary position embeddings.
+
+The contract
+------------
+Three properties define the problem:
+
+  P1 (isometry)     <R(p) q, R(p) k> = <q, k>          no dot-product distortion
+  P2 (relativity)   <R(p) q, R(p') k> depends only on  p - p'   every position is
+                    the head of the line relative to its own history
+  P3 (circularity)  R(p + m) = R(p) exactly            circumference m, set once
+
+P1 forces R(p) in O(D). P2 forces R(p)^T R(p') = F(p - p') and F is then a group
+homomorphism: F(a + b) = F(a) F(b), F(0) = I. P3 makes F a homomorphism from the
+cyclic group Z_m into O(D).
+
+The classification theorem (real representation theory of Z_m, Peter-Weyl for
+finite abelian groups): every such F is, in some fixed orthonormal basis P, a
+block-diagonal sum of 2x2 rotations by angles 2*pi*k_j/m with k_j integers,
+plus possibly trivial (frozen) and sign (period-2) one-dimensional blocks. The
+basis P is gauge: it is absorbed by the learned projections W_q and W_k that sit
+immediately upstream. Therefore the entire solution space of the contract is
+RoPE whose frequencies live on the integer lattice 2*pi*Z/m. Nothing else
+exists. The remaining design freedom, and it is the whole game, is the multiset
+of D/2 integers {k_j}.
+
+Why decay cannot live inside the cylinder: P2 + P3 give F(1)^m = I even without
+P1, so F(1) has finite order, all eigenvalues are roots of unity, and F(1) is
+semisimple. No direction contracts. Forgetting is mathematically exiled to the
+attention mask and to whatever consolidates the past. That division of labor is
+forced, not stylistic.
+
+Aliasing bounds: with a causal sliding window of width w, visible offsets lie in
+[0, w]. Two visible keys collide only if their offsets are congruent mod m, so
+the hard requirement is w <= m - 1. The cosine (symmetric) component of the
+kernel satisfies g(d) = g(m - d), so resolution of the symmetric part degrades
+approaching m/2; the sine component keeps directionality but w <= m/2 is the
+comfortable regime. Recommended: m >= 2w, and on-the-fly mode makes large m free.
+
+Kernel design: the positional prior is the kernel
+    g(d) = (2/D) * sum_j cos(2*pi*k_j*d/m),
+the positive-definite functions on Z_m realizable with integer multiplicities
+(Herglotz/Bochner: nonnegative spectral weights; here weights are quantized to
+plane counts). Because the mask hides every offset beyond w, the band
+(w, m - w) is a genuine don't-care region, a luxury classical window design does
+not have, so concentration on [0, w] can be much sharper than any full-period
+design. design='pursuit' runs a greedy unit-amplitude matching pursuit over the
+harmonic dictionary restricted to [0, w]: each rotation plane contributes
+exactly one unit cosine, so the pursuit selects the multiset directly,
+multiplicities emerging as repeated picks. design='snap' and
+design='snap_sigmoid' project a known-good continuous spectrum (log-spaced, or
+the two-sided sigmoidal logspace) onto the lattice with no loss of intent.
+
+Exactness properties bought:
+  * The group action is transitive: there is no positional observable except the
+    masked offset. Length generalization is exact at the encoding level.
+  * KV cache entries are rotated once and are valid forever. No re-anchoring,
+    no re-rotation of cached keys, ever.
+  * Phases are computed by integer modular arithmetic: (p * k) mod m in int64,
+    then one float multiply. Position 10**15 has bit-exact phase where vanilla
+    RoPE in fp32 has already shed all low-frequency precision.
+
+Usage
+-----
+    rope = CylinderRoPE(dim=head_dim, m=8192, window=4096)
+    q = rope(q, positions)   # positions: absolute int64 token counter, any size
+    k = rope(k, positions)   # attention owns the counter and the mask;
+                             # rope owns the wrap. Mask offsets > window.
+
+positions may be shape (T,) or (B, T). x is (B, H, T, D).
+"""
+
+import math
+import warnings
+from functools import reduce
+
+import torch
+import torch.nn as nn
+
+
+# ----------------------------------------------------------------------------
+# target kernels for pursuit design (defined on offsets d = 0 .. window)
+# ----------------------------------------------------------------------------
+
+def hann_target(window: int, height: float) -> torch.Tensor:
+    d = torch.arange(window + 1, dtype=torch.float64)
+    return height * 0.5 * (1.0 + torch.cos(math.pi * d / window))
+
+
+def exp_target(window: int, height: float, tau: float) -> torch.Tensor:
+    d = torch.arange(window + 1, dtype=torch.float64)
+    return height * torch.exp(-d / tau)
+
+
+def spike_plus_tail_target(window: int, height: float,
+                           spike_frac: float = 0.35,
+                           tau: float = None) -> torch.Tensor:
+    """Sharp local-resolution spike at d=0 riding on a slow Hann tail across the
+    window. Mimics the shape of empirically successful RoPE kernels."""
+    if tau is None:
+        tau = max(1.0, window / 48.0)
+    return (spike_frac * exp_target(window, height, tau)
+            + (1.0 - spike_frac) * hann_target(window, height))
+
+
+# ----------------------------------------------------------------------------
+# harmonic multiset designs
+# ----------------------------------------------------------------------------
+
+def design_pursuit(dim_half: int, m: int, window: int,
+                   target: torch.Tensor = None) -> list:
+    """Greedy unit-amplitude matching pursuit over integer harmonics
+    k in [1, m//2 - 1]. Fits sum_j cos(2*pi*k_j*d/m) to `target` on
+    d in [0, window] only; the masked band is don't-care. Returns a sorted
+    list of dim_half integers, repeats allowed (multiplicity = weight)."""
+    assert m >= 6 and 1 <= window <= m - 1
+    if target is None:
+        target = spike_plus_tail_target(window, float(dim_half))
+    target = target.to(torch.float64)
+    assert target.numel() == window + 1
+
+    K = m // 2 - 1  # usable harmonics: 1 .. K (exclude DC and the sign rep)
+
+    # ||a_k||^2 over the window, via one FFT of the window indicator:
+    # sum_{d=0..w} cos^2(2 pi k d / m) = (w+1)/2 + (1/2) Re S[2k mod-folded]
+    ind = torch.zeros(m, dtype=torch.float64)
+    ind[: window + 1] = 1.0
+    ReS = torch.fft.rfft(ind).real                      # bins 0 .. m//2
+    ks = torch.arange(1, K + 1)
+    fold = torch.where(2 * ks <= m // 2, 2 * ks, m - 2 * ks)
+    atom_n2 = (window + 1) / 2.0 + 0.5 * ReS[fold]
+
+    residual = torch.zeros(m, dtype=torch.float64)
+    residual[: window + 1] = target
+    d = torch.arange(window + 1, dtype=torch.float64)
+
+    chosen = []
+    for _ in range(dim_half):
+        # correlation of residual (supported on the window) with every atom,
+        # all bins at once: Re rfft(residual)[k] = sum_d r(d) cos(2 pi k d / m)
+        corr = torch.fft.rfft(residual).real[1: K + 1]
+        scores = 2.0 * corr - atom_n2                   # squared-error reduction
+        k = int(torch.argmax(scores).item()) + 1
+        chosen.append(k)
+        residual[: window + 1] -= torch.cos(2 * math.pi * k * d / m)
+    return sorted(chosen)
+
+
+def design_snap(dim_half: int, m: int,
+                w_min: float = None, w_max: float = math.pi / 2) -> list:
+    """Log-spaced spectrum snapped to the lattice. Defaults: highest frequency
+    pi/2 (one rotation per four tokens), lowest 2*pi/m (k = 1, one rotation per
+    circumference)."""
+    if w_min is None:
+        w_min = 2 * math.pi / m
+    if dim_half == 1:
+        omegas = torch.tensor([math.sqrt(w_min * w_max)], dtype=torch.float64)
+    else:
+        omegas = torch.logspace(math.log10(w_max), math.log10(w_min),
+                                dim_half, dtype=torch.float64)
+    k = torch.round(omegas * m / (2 * math.pi)).long().clamp(1, m // 2 - 1)
+    return sorted(k.tolist())
+
+
+def design_snap_sigmoid(dim_half: int, m: int,
+                        w_min: float = None, w_max: float = math.pi / 2,
+                        base: float = 10.0) -> list:
+    """The two-sided sigmoidal logspace (mass piled at both spectral ends,
+    sparse middle), snapped to the lattice. Ports the tuned spectrum losslessly
+    in intent; the lattice supplies the exact circularity."""
+    if w_min is None:
+        w_min = 2 * math.pi / m
+    n_hi = dim_half // 2
+    n_lo = dim_half - n_hi
+    hi = torch.logspace(math.log(w_min, base), math.log(w_max, base),
+                        n_hi, base=base, dtype=torch.float64)
+    lo = w_max - torch.logspace(math.log(w_min, base), math.log(w_max, base),
+                                n_lo + 1, base=base, dtype=torch.float64)[:-1]
+    omegas = torch.cat([hi, lo])
+    k = torch.round(omegas * m / (2 * math.pi)).long().clamp(1, m // 2 - 1)
+    return sorted(k.tolist())
+
+
+def wrapped_exponential_spectrum(m: int, taus, weights,
+                                 dc_frac: float) -> torch.Tensor:
+    """Fourier weights on Z_m of f(d) = dc + (1-dc) * sum_i w_i exp(-dist/tau_i)
+    with dist the circular distance. Each exponential wraps to a Poisson kernel
+    whose Fourier coefficients are strictly positive (Herglotz), so the mixture
+    is positive definite with a fully positive spectrum. Returns the per-
+    harmonic amplitude weights v[k] for k = 0 .. m//2 - 1 (k = 0 is the DC /
+    frozen-plane mass), normalized so sum(v) ~= f(0) = 1."""
+    d = torch.arange(m, dtype=torch.float64)
+    dist = torch.minimum(d, m - d)
+    w = torch.tensor(weights, dtype=torch.float64)
+    w = w / w.sum()
+    f = torch.zeros(m, dtype=torch.float64)
+    for wi, tau in zip(w.tolist(), taus):
+        f += wi * torch.exp(-dist / tau)
+    f = dc_frac + (1.0 - dc_frac) * f
+    c = torch.fft.rfft(f).real / m
+    v = torch.cat([c[:1], 2.0 * c[1: m // 2]])     # k = 0 .. m//2 - 1
+    return v.clamp_min(0.0)
+
+
+def _equal_mass_atoms(v: torch.Tensor, n: int) -> list:
+    """Deterministic equal-mass quantization of a nonnegative spectral measure
+    into n unit atoms: place atom i at the ((i + 0.5)/n)-quantile of the
+    spectral CDF. Compact mass reproduces multiplicities; heavy tails get
+    stratified single atoms instead of being truncated, which is what unit-
+    amplitude planes require."""
+    cdf = torch.cumsum(v, dim=0)
+    cdf = cdf / cdf[-1]
+    targets = (torch.arange(n, dtype=torch.float64) + 0.5) / n
+    idx = torch.searchsorted(cdf, targets)
+    return idx.clamp(0, v.numel() - 1).tolist()
+
+
+def design_poisson(dim_half: int, m: int, window: int,
+                   taus=None, weights=None, dc_frac: float = 0.09,
+                   target_kernel: torch.Tensor = None) -> list:
+    """Bernstein-class kernel design. Completely monotone kernels, the smooth
+    nonnegative monotone decays with no zero crossing, are exactly mixtures of
+    exponentials (Bernstein/Hausdorff); each exponential wraps on Z_m to a
+    Poisson kernel with strictly positive Fourier weights. Quantizing that
+    spectrum to dim_half unit-amplitude planes by largest remainder yields a
+    multiset whose kernel tracks the mixture by construction: g(d) ~= dc
+    + (1-dc) * sum_i w_i exp(-d/tau_i), with the dc mass realized as frozen
+    (position-free) planes, i.e., partial rotary derived rather than assumed,
+    and acting as a hard positive floor under quantization ripple.
+    Defaults: a short component for local resolution and a long component
+    matching an exp(-pi d / window) envelope across the window."""
+    if taus is None:
+        taus = (3.0, window / math.pi)
+    if weights is None:
+        weights = (0.25, 0.75)
+    v = wrapped_exponential_spectrum(m, taus, weights, dc_frac)
+    return sorted(_equal_mass_atoms(v, dim_half))
+
+
+def _dither_order(n: int) -> list:
+    """The fold-shuffle permutation of plane assignment. At the kernel level
+    this is conjugation by a permutation matrix, hence gauge; it is kept because
+    plane assignment can matter to optimizer dynamics."""
+    order = list(range(n))
+    if n >= 4:
+        for _ in range(int(math.log2(n)) - 1):
+            order = order[0::2] + order[1::2]
+    return order
+
+
+# ----------------------------------------------------------------------------
+# the module
+# ----------------------------------------------------------------------------
+
+class CylinderRoPE(nn.Module):
+    """Rotary embeddings on the cyclic group Z_m. Drop-in for rotary application
+    sites; keeps the split-half dual convention (first half of dims uses the
+    conjugate rotation direction, second half the standard one) for
+    compatibility. Note on that convention: for a fixed anisotropic pair q != k
+    the per-plane logit is S*cos(w d) + sigma*A*sin(w d) with S the symmetric
+    and A the antisymmetric pairing of the plane components and sigma = +-1 the
+    direction convention. Flipping sigma flips the phase of every plane,
+    phi -> -phi in r*cos(w d - sigma*phi), and changes the interference pattern
+    and therefore the match SNR for fixed content. The conventions are
+    equivalent only modulo a relearning of W_q, W_k (b -> -b in those planes),
+    i.e., the achievable set is identical but no fixed-input kernel is.
+
+    Parameters
+    ----------
+    dim     : head dimension D (multiple of 4 under the split-half convention)
+    m       : circumference. R(p + m) = R(p) exactly. Hard floor: window + 1.
+              Recommended: >= 2 * window. Large m is free in on-the-fly mode.
+    window  : sliding attention window the mask will enforce. Used for kernel
+              design and for the aliasing guard. Defaults to m // 2.
+    design  : 'pursuit' | 'snap' | 'snap_sigmoid' | 'explicit'
+    harmonics : explicit multiset of dim//2 integers when design='explicit'
+    target  : optional pursuit target on d = 0..window (tensor, length window+1)
+    dither  : apply the fold-shuffle to plane assignment (default True)
+    split_half_convention : keep the dual h1-conjugate / h2-standard layout
+    cache_limit_bytes : precompute the full (m, dim//2) phase table when it fits;
+              otherwise compute phases on the fly with exact int64 modular
+              arithmetic. Both paths are bit-identical in result.
+    """
+
+    def __init__(self, dim: int, m: int, window: int = None,
+                 design: str = 'pursuit', harmonics: list = None,
+                 target: torch.Tensor = None,
+                 w_min: float = None, w_max: float = math.pi / 2,
+                 dither: bool = True, split_half_convention: bool = True,
+                 cache_limit_bytes: int = 256 * 2 ** 20):
+        super().__init__()
+        if split_half_convention:
+            assert dim % 4 == 0, "split-half convention needs dim % 4 == 0"
+        else:
+            assert dim % 2 == 0
+        m = int(m)
+        assert m >= 6
+        if window is None:
+            window = m // 2
+        assert 1 <= window <= m - 1, "hard aliasing bound: window <= m - 1"
+        if window > m // 2:
+            warnings.warn("window > m/2: the symmetric kernel component "
+                          "satisfies g(d) = g(m-d); resolution degrades near "
+                          "m/2. Prefer m >= 2*window.")
+        self.dim, self.m, self.window = dim, m, window
+        self.split_half_convention = split_half_convention
+        n = dim // 2
+
+        if design == 'explicit':
+            assert harmonics is not None and len(harmonics) == n
+            ks = [int(k) for k in harmonics]
+            assert all(0 <= k <= m - 1 for k in ks)
+        elif design == 'pursuit':
+            ks = design_pursuit(n, m, window, target)
+        elif design == 'poisson':
+            ks = design_poisson(n, m, window)
+        elif design == 'snap':
+            ks = design_snap(n, m, w_min, w_max)
+        elif design == 'snap_sigmoid':
+            ks = design_snap_sigmoid(n, m, w_min, w_max)
+        else:
+            raise ValueError(design)
+
+        nz = [k for k in ks if k > 0]
+        g = reduce(math.gcd, nz, m) if nz else m
+        if g > 1:
+            warnings.warn(f"gcd(harmonics, m) = {g}: effective circumference "
+                          f"is m/{g} = {m // g}, not m.")
+        self.effective_period = m // g
+
+        ks_sorted = sorted(ks, reverse=True)
+        if dither:
+            order = _dither_order(n)
+            ks_final = [ks_sorted[i] for i in order]
+        else:
+            ks_final = ks_sorted
+        self.register_buffer('harmonics',
+                             torch.tensor(ks_final, dtype=torch.int64))
+
+        table_bytes = m * n * 2 * 4
+        self.cached = table_bytes <= cache_limit_bytes
+        if self.cached:
+            p = torch.arange(m, dtype=torch.int64)
+            phase = (p[:, None] * self.harmonics[None, :]) % m   # exact int64
+            ang = phase.to(torch.float64) * (2 * math.pi / m)
+            self.register_buffer('cos_cached', ang.cos().to(torch.float32))
+            self.register_buffer('sin_cached', ang.sin().to(torch.float32))
+
+    # -- phase lookup ---------------------------------------------------------
+
+    def _cos_sin(self, positions: torch.Tensor):
+        """positions: int64, shape (T,) or (B, T), any magnitude (also negative;
+        Python-style modulo wraps correctly). Returns cos, sin broadcastable
+        against (B, H, T, D//2)."""
+        idx = positions.to(torch.int64) % self.m
+        if self.cached:
+            cos = self.cos_cached[idx]
+            sin = self.sin_cached[idx]
+        else:
+            phase = (idx.unsqueeze(-1) * self.harmonics) % self.m   # exact
+            ang = phase.to(torch.float64) * (2 * math.pi / self.m)
+            cos = ang.cos().to(torch.float32)
+            sin = ang.sin().to(torch.float32)
+        if positions.dim() == 1:
+            cos, sin = cos[None, None], sin[None, None]          # (1,1,T,n)
+        elif positions.dim() == 2:
+            cos, sin = cos[:, None], sin[:, None]                # (B,1,T,n)
+        else:
+            raise ValueError("positions must be (T,) or (B, T)")
+        return cos, sin
+
+    # -- application ----------------------------------------------------------
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor = None):
+        """x: (B, H, T, D). positions: absolute token counter; the caller
+        (attention) owns it. Defaults to arange(T) when omitted."""
+        if positions is None:
+            positions = torch.arange(x.shape[-2], device=x.device)
+        cos, sin = self._cos_sin(positions)
+        cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+
+        if not self.split_half_convention:
+            a, b = x[..., 0::2], x[..., 1::2]
+            out_a = a * cos - b * sin
+            out_b = a * sin + b * cos
+            return torch.stack([out_a, out_b], dim=-1).flatten(-2)
+
+        D = x.shape[-1]
+        mid = D // 2
+        h1, h2 = x[..., :mid], x[..., mid:]
+        h1_a, h1_b = h1[..., 0::2], h1[..., 1::2]
+        h2_a, h2_b = h2[..., 0::2], h2[..., 1::2]
+
+        npp = mid // 2                                   # pairs per half
+        cos1, sin1 = cos[..., :npp], sin[..., :npp]
+        cos2, sin2 = cos[..., npp:], sin[..., npp:]
+
+        out_h1_a = h1_a * cos1 + h1_b * sin1             # conjugate direction
+        out_h1_b = -h1_a * sin1 + h1_b * cos1
+        out_h2_a = h2_a * cos2 - h2_b * sin2             # standard direction
+        out_h2_b = h2_a * sin2 + h2_b * cos2
+
+        out_h1 = torch.stack([out_h1_a, out_h1_b], dim=-1).flatten(-2)
+        out_h2 = torch.stack([out_h2_a, out_h2_b], dim=-1).flatten(-2)
+        return torch.cat([out_h1, out_h2], dim=-1)
+
+    # -- diagnostics ----------------------------------------------------------
+
+    @torch.no_grad()
+    def step_displacement(self, plane_energy: torch.Tensor = None) -> float:
+        """||R(p+1) x - R(p) x|| / ||x||, which is independent of p because the
+        action is isometric: consecutive positions are equidistant points on the
+        orbit. This, not the slope of any single scalar projection, is the
+        invariant measure of per-step distinguishability. plane_energy: optional
+        per-plane energy fractions of x (defaults to isotropic)."""
+        w = 2 * math.pi * self.harmonics.to(torch.float64) / self.m
+        per_plane = 2.0 * (1.0 - torch.cos(w))
+        if plane_energy is None:
+            return float(per_plane.mean().sqrt())
+        e = plane_energy.to(torch.float64)
+        return float((e / e.sum() * per_plane).sum().sqrt())
+
+    @torch.no_grad()
+    def relative_kernel(self, d: torch.Tensor = None) -> torch.Tensor:
+        """g(d) = E[<R(p+d) q, R(p) q>] / E[|q|^2] for isotropic q: the mean
+        cosine over planes. The positional prior the model trains against."""
+        if d is None:
+            d = torch.arange(min(self.m, 4 * self.window + 1))
+        d = d.to(torch.int64) % self.m
+        phase = (d[:, None] * self.harmonics.cpu()) % self.m
+        ang = phase.to(torch.float64) * (2 * math.pi / self.m)
+        return ang.cos().mean(dim=1)
+
+    @torch.no_grad()
+    def directional_kernel(self, d: torch.Tensor = None) -> torch.Tensor:
+        """Mean sine over planes: the antisymmetric component that gives
+        before/after orientation to anisotropic q, k."""
+        if d is None:
+            d = torch.arange(min(self.m, 4 * self.window + 1))
+        d = d.to(torch.int64) % self.m
+        phase = (d[:, None] * self.harmonics.cpu()) % self.m
+        ang = phase.to(torch.float64) * (2 * math.pi / self.m)
+        return ang.sin().mean(dim=1)
+
+
+def sliding_window_mask(q_pos: torch.Tensor, k_pos: torch.Tensor,
+                        window: int) -> torch.Tensor:
+    """Boolean mask, True = attend. Causal sliding window on absolute counters:
+    attend iff 0 <= q_pos - k_pos <= window. This is the entire anti-resonance
+    mechanism: it hides every aliased copy of the kernel."""
+    d = q_pos[:, None] - k_pos[None, :]
+    return (d >= 0) & (d <= window)
 
 
 class RoPE(nn.Module):
