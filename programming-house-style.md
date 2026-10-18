@@ -76,7 +76,11 @@ Name storage operations precisely. Fill edits live elements. Reserve preserves v
 
 State whether inputs and outputs may share storage. Different names and read-only access do not establish disjointness. Keep borrows valid through use: reallocation, replacement, release, and destruction can invalidate them. Removing an element ends its lifetime even if its bytes remain. A moved allocation can retain its address under a new owner. Retaining a borrow across deferred work or mutation requires a lifetime guarantee.
 
+A function that returns a borrow of an argument refuses temporaries: delete its rvalue overload, so a borrow of a value that ends with the statement cannot compile. Declare a borrower after what it borrows, so it is destroyed first; an object that reports into another, including from its destructor, must not outlive it.
+
 Check size multiplication, shape products, capacity growth, and alignment before use. Match allocation and release. Initialize every region that will be read, including padding; clear only where the next operation needs it. Define empty-state behavior. Publish replacement storage only after initialization succeeds.
+
+Memory errors and undefined behaviour are defects wherever they occur, tests included. Check for them mechanically: run the whole suite under address and undefined-behaviour sanitizers, and treat a finding as a failure.
 
 If allocation failure is reported solely by a Boolean, keep element construction and relocation from escaping through another failure mechanism. Preserve old contents on failed replacement when promised; preparing a replacement may require both allocations at once.
 
@@ -127,6 +131,8 @@ Use explicit results for expected alternatives. Use exceptions at operation or s
 Assert internal preconditions; validate external inputs. Disabled assertions cannot reject invalid sizes or stale identities. Return complete success or failure states so callers need not infer validity from unrelated fields.
 
 Foreign interfaces specify types, counts, ownership, destruction, errors, callback context, and identity validity. Keep language-specific layouts and ownership behind the interface. Contain exceptions where they cannot cross. Use thin wrappers to restore native resource conventions.
+
+Take a foreign entry point's type from its declaration, through `decltype` of the declared function or a static assertion against it; never retype it by hand. A call through a mismatched function type is undefined behaviour even where it happens to work.
 
 **10. C++ spelling**
 
