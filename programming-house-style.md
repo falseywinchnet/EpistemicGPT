@@ -8,7 +8,7 @@ Distinguish types whose confusion causes bugs: byte offsets and character positi
 
 Choose numerical precision once. Use doubles throughout a computation specified in doubles. Keep storage reusable without adding precision, layout, execution, and allocator parameters to every algorithm.
 
-Name fields so callers need not memorize positions. Group related data in records. Use enums for alternatives and named factories when several fields must agree. Initialize independent options directly. Initialize each variable explicitly.
+Name fields so callers need not memorize positions. Group related data in records. Use enums for alternatives and named factories when several fields must agree. Prefer a shape that cannot hold contradictory values to a check that rejects them. Initialize independent options directly. Initialize each variable explicitly.
 
 State array shape, active length, axes, and layout. Distinguish capacity from live length and maximum bounds from active regions. Fixed dimensions represent real bounds. Choose index types that support the required arithmetic; account for negative differences and signed/unsigned conversions.
 
@@ -129,6 +129,8 @@ Specify whether failure leaves output unchanged, empty, partial, or invalid. Val
 Use explicit results for expected alternatives. Use exceptions at operation or subsystem failure boundaries that permit them. Keep routine hot-path decisions ordinary control flow. Clean up on every exit and define resource-exhaustion behavior.
 
 Assert internal preconditions; validate external inputs. Disabled assertions cannot reject invalid sizes or stale identities. Return complete success or failure states so callers need not infer validity from unrelated fields.
+
+A switch over a closed set still has a default, and a state machine still says what an unexpected input does in each state. Send those cases, including ones believed impossible, to one defined fallback: a named failure, a reset, or an input ignored for a stated reason. Do not add checks along the way to compensate.
 
 Foreign interfaces specify types, counts, ownership, destruction, errors, callback context, and identity validity. Keep language-specific layouts and ownership behind the interface. Contain exceptions where they cannot cross. Use thin wrappers to restore native resource conventions.
 
