@@ -130,7 +130,7 @@ Use explicit results for expected alternatives. Use exceptions at operation or s
 
 Assert internal preconditions; validate external inputs. Disabled assertions cannot reject invalid sizes or stale identities. Return complete success or failure states so callers need not infer validity from unrelated fields.
 
-A switch over a closed set still has a default, and a state machine still says what an unexpected input does in each state. Send those cases, including ones believed impossible, to one defined fallback: a named failure, a reset, or an input ignored for a stated reason. Do not add checks along the way to compensate.
+A switch over a closed set still has a default, and a state machine still says what an unexpected input does in each state. Send those cases, including ones believed impossible, to one defined fallback: a named failure, a reset, or an input ignored for a stated reason. Do not add checks along the way to compensate. A switch that names every enumerator, leaves from each case, and reaches its fallback directly after the switch also qualifies; omitting `default` there keeps the compiler's warning for a new enumerator.
 
 Foreign interfaces specify types, counts, ownership, destruction, errors, callback context, and identity validity. Keep language-specific layouts and ownership behind the interface. Contain exceptions where they cannot cross. Use thin wrappers to restore native resource conventions.
 
