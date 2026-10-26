@@ -169,3 +169,10 @@ Give substantial types, storage owners, and state machines meaningful source bou
 Use descriptive boundary names and short conventional mathematical names locally. Keep formatting consistent. Omit accessors, wrappers, and indirection that add no invariant or useful operation.
 
 Explain non-obvious dimensions, padding, normalization, lifetime, overlap, disposal order, and boundaries. State why a surprising operation exists. Preserve useful mathematical correspondence and remove stale comments. Keep vocabulary steady through the procedure.
+
+**Addendum: simple habits at storage boundaries**
+
+- Before growing or replacing storage, finish reading any input that might refer to it. A read-only pointer or span can still point into the object being changed; copy the needed input first when overlap is allowed.
+- Treat an open stream and a closed or failed stream as different states. Check the live handle before I/O, and change byte counts only for bytes actually transferred.
+- Find the visible work area before allocating scratch for it. Check the entire size calculation, including padding and conversion to a smaller type. An unrepresentable size is not an empty image.
+- Try the awkward boundary case for each such operation: input from its own storage, a closed stream, a huge extent with a tiny visible clip, or a size near the integer limit. A check that reports a failure must also make its caller or build step fail, even when output is copied to a log.
