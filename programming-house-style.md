@@ -175,4 +175,5 @@ Explain non-obvious dimensions, padding, normalization, lifetime, overlap, dispo
 - Before growing or replacing storage, finish reading any input that might refer to it. A read-only pointer or span can still point into the object being changed; copy the needed input first when overlap is allowed.
 - Treat an open stream and a closed or failed stream as different states. Check the live handle before I/O, and change byte counts only for bytes actually transferred.
 - Find the visible work area before allocating scratch for it. Check the entire size calculation, including padding and conversion to a smaller type. An unrepresentable size is not an empty image.
+- If a call can return owned storage, adopt it before checking its success flag; failure can still leave storage to release.
 - Try the awkward boundary case for each such operation: input from its own storage, a closed stream, a huge extent with a tiny visible clip, or a size near the integer limit. A check that reports a failure must also make its caller or build step fail, even when output is copied to a log.
